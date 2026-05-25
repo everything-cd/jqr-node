@@ -516,6 +516,25 @@ app.get("/", (req, res) => {
                     openDetails.forEach(id => { const el = document.getElementById(id); if (el) el.open = true; });
                 }
 
+                // 关键修复：将核心函数挂载到全局 window 对象，使 onclick 能调用
+                window.addBot = addBot;
+                window.updateUI = updateUI;
+                window.restartNow = restartNow;
+                window.toggle = toggle;
+                window.removeBot = removeBot;
+                window.setTimer = setTimer;
+                window.savePto = savePto;
+                window.toggleGuard = toggleGuard;
+                window.uploadFile = uploadFile;
+                window.showView = showView;
+                window.openAppCenter = openAppCenter;
+                window.closeAppCenter = closeAppCenter;
+                window.startFF = startFF;
+                window.stopFF = stopFF;
+                window.uninstallFF = uninstallFF;
+                window.loadFFStatus = loadFFStatus;
+                // timerUI 已经直接挂到 window，无需额外处理
+
                 const welcomeAudio = document.getElementById('welcome-audio'); welcomeAudio.volume = 0.8; let playPromise = welcomeAudio.play(); if (playPromise !== undefined) { playPromise.catch(() => { const playOnInteraction = () => { welcomeAudio.play(); document.removeEventListener('click', playOnInteraction); document.removeEventListener('keydown', playOnInteraction); }; document.addEventListener('click', playOnInteraction); document.addEventListener('keydown', playOnInteraction); }); }
                 setInterval(() => { updateUI(false); updateSystemStatus(); const modal = document.getElementById('modal-app-center'); if(modal.classList.contains('active')) { if(document.getElementById('view-ff').classList.contains('active-view')) loadFFStatus(); } }, 3000);
                 updateUI(true);
