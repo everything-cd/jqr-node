@@ -2,7 +2,8 @@ FROM node:20-alpine3.20
 
 WORKDIR /tmp
 
-COPY index.js index.html package.json ./
+# 只复制 index.js 和 package.json，去掉了 index.html
+COPY index.js package.json ./
 
 EXPOSE 7860
 
