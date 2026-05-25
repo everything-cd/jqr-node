@@ -7,4 +7,5 @@ huggingface视频教程地址：https://youtu.be/XERxg9AODeo
 3. 将hug分支中的index.js填写需要的变量后混淆保存，js混肴地址：https://obfuscator.io 
 4. 在.github/workflows/build-hug-image.yml 44中修改镜像名称
 5. 去huggingface创建空白space，docker
-6. 创建一个新文件，文件名`Dockerfile` 内容如下:
+6. 创建一个新文件，文件名`Dockerfile`
+7. 在 HuggingFace Space 的 Settings → Environment Variables 中添加 `PANEL_PASSWORD`，设为你的自定义密码（未设置时默认 `admin`）
