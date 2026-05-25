@@ -5,7 +5,6 @@
  * 应用中心：火狐浏览器(支持自定义配置)
  * 机器人增强：翼龙守护进程 (每3分钟自动检测开机)
  * 新增功能：定时访问 (每2分钟保活URL列表)
- * 安全增强：面板密码登录保护 (环境变量 PANEL_PASSWORD)
  * ============================================================
  */
 const fs = require('fs').promises;
@@ -39,41 +38,6 @@ let ffLiteProcess = null, cfTunnelProcess = null, cfTunnelUrl = '', ffLogs = [];
 
 app.use(express.json());
 
-// ========== 登录认证系统 ==========
-const PANEL_PASSWORD = process.env.PANEL_PASSWORD || 'admin';
-const authTokens = new Set();
-
-// 登录路由（必须放在认证中间件之前）
-app.post('/api/login', (req, res) => {
-    const { password } = req.body;
-    if (password === PANEL_PASSWORD) {
-        const token = Math.random().toString(36).substring(2) + Date.now().toString(36);
-        authTokens.add(token);
-        return res.json({ success: true, token });
-    }
-    res.status(401).json({ success: false, error: '密码错误' });
-});
-
-app.post('/api/logout', (req, res) => {
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.split(' ')[1];
-        authTokens.delete(token);
-    }
-    res.json({ success: true });
-});
-
-// 认证中间件（保护所有 /api/* 路由，除了 login/logout）
-app.use('/api', (req, res, next) => {
-    if (req.path === '/login' || req.path === '/logout') return next();
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.split(' ')[1];
-        if (authTokens.has(token)) return next();
-    }
-    res.status(401).json({ error: '未授权' });
-});
-
 // --- [ 1. 拟人化深度词库矩阵 ] ---
 const CHAT_DB = { idle: ["有人吗", "2333", "啧", "挂机中", "emm", "好无聊啊", "这服人怎么这么少", "有点卡啊", "这延迟绝了", "我先挂会机", "刷点东西真累", "有人带带萌新吗", "woc刚才那个怪", "有人在不", "又是努力挂机的一天", "这天气不错", "有人聊天吗", "刚才卡了一下", "我去倒杯水", "先眯一会", "草（一种植物）", "害"], interaction: ["？", "你说啥", "没注意看", "哦哦", "搜嘎", "确实", "我也是这么想的", "哈哈哈哈", "666", "强啊大佬", "nb", "可以的", "羡慕了", "别cue我", "在呢"], suffixes: ["~", "...", "捏", "哈", "呀", "！", "？", "w"], typos: { "挂机": ["刮机", "挂机机"], "有人": ["友谊", "有仁"], "怎么": ["咋"], "没有": ["木有"] } };
 function generateNaturalChat(type = 'idle') { let pool = CHAT_DB[type]; let msg = pool[Math.floor(Math.random() * pool.length)]; if (Math.random() > 0.9) { for (let key in CHAT_DB.typos) { if (msg.includes(key)) { msg = msg.replace(key, CHAT_DB.typos[key][Math.floor(Math.random() * CHAT_DB.typos[key].length)]); break; } } } if (Math.random() > 0.7) msg += CHAT_DB.suffixes[Math.floor(Math.random() * CHAT_DB.suffixes.length)]; if (Math.random() > 0.8) msg = (Math.random() > 0.5 ? " " : "") + msg + (Math.random() > 0.5 ? " " : ""); return msg; }
@@ -86,6 +50,7 @@ setInterval(() => { const status = getMemoryStatus(); if (parseFloat(status.perc
 function executeRestartSequence(botInstance, botMeta) { if (!botInstance || !botInstance.entity) return; botInstance.chat('/restart'); botMeta.pushLog(`⚡ 重启序列(1/2): /restart`, 'text-red-400 font-bold'); setTimeout(() => { if (botInstance && botInstance.entity) { botInstance.chat('restart'); botMeta.pushLog(`⚡ 重启序列(2/2): restart`, 'text-red-500 font-bold'); } }, 800); botMeta.lastRestartTick = Date.now(); }
 
 // --- [ 4. 核心持久化与机器人工厂 ] ---
+// 同步写入，确保数据立即保存到磁盘
 function saveBotsConfig() {
     try {
         const config = Array.from(activeBots.values()).map(b => ({
@@ -204,7 +169,13 @@ app.get("/", (req, res) => {
             .modal-content { transform: scale(0.95); transition: transform 0.3s ease; } .modal-overlay.active .modal-content { transform: scale(1); }
             .view-section { display: none; } .view-section.active-view { display: block; animation: fadeIn 0.2s ease; }
             @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-            .bot-card { padding: 0.8rem !important; border-radius: 1rem !important; font-size: 0.75rem; }
+
+            /* 紧凑卡片样式（无 scale，避免闪烁） */
+            .bot-card {
+                padding: 0.8rem !important;
+                border-radius: 1rem !important;
+                font-size: 0.75rem;
+            }
             .bot-card .text-xl { font-size: 1.0rem !important; }
             .bot-card .h-40 { height: 7rem !important; }
             .bot-card .py-2\\.5 { padding-top: 0.35rem !important; padding-bottom: 0.35rem !important; }
@@ -218,143 +189,130 @@ app.get("/", (req, res) => {
         </style>
     </head>
     <body class="p-4 md:p-8 pb-24">
-        <div id="login-overlay" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-            <div class="glass rounded-2xl p-8 w-full max-w-sm border border-white/10 shadow-2xl">
-                <div class="text-center mb-6">
-                    <div class="text-5xl mb-3">🤗</div>
-                    <h2 class="text-xl font-bold text-white">机器人面板</h2>
-                    <p class="text-slate-400 text-sm mt-1">请输入访问密码</p>
+        <div class="max-w-7xl mx-auto">
+            <header class="flex flex-col md:flex-row justify-between items-center mb-10 gap-6">
+                <div class="flex items-center gap-6">
+                    <div><h1 class="text-4xl font-black bg-gradient-to-r from-blue-400 via-emerald-400 to-purple-400 bg-clip-text text-transparent uppercase tracking-tighter">Pathfinder PRO</h1><p class="text-slate-500 text-sm mt-1 font-medium tracking-wide">Minecraft 拟人挂机系统 v2025</p></div>
+                    <button onclick="openAppCenter()" class="glass border border-white/10 px-5 py-2.5 rounded-2xl text-sm font-bold text-slate-300 hover:text-white hover:border-white/20 transition-all flex items-center gap-2 shadow-lg"><span class="text-lg">🚀</span> 应用中心</button>
                 </div>
-                <input id="login-password" type="password" placeholder="密码" class="input-dark w-full rounded-xl px-4 py-3 text-sm text-white mb-4">
-                <button onclick="doLogin()" class="btn-primary w-full py-3 rounded-xl text-sm font-bold">登录</button>
-                <p id="login-error" class="text-red-400 text-xs mt-3 text-center hidden">密码错误</p>
-            </div>
+                <div class="glass p-2 rounded-2xl flex gap-2 w-full md:w-auto border border-white/10">
+                    <input id="h" placeholder="IP:PORT" class="input-dark rounded-xl px-4 py-2.5 text-sm text-white flex-1 md:w-48">
+                    <input id="u" placeholder="角色名" class="input-dark rounded-xl px-4 py-2.5 text-sm text-white md:w-36">
+                    <button onclick="addBot()" class="btn-primary text-white px-6 py-2.5 rounded-xl text-sm font-bold active:scale-95">部署角色</button>
+                </div>
+            </header>
+            <div id="list" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6"></div>
         </div>
-        <div id="main-content" class="hidden">
-            <div class="max-w-7xl mx-auto">
-                <header class="flex flex-col md:flex-row justify-between items-center mb-10 gap-6">
-                    <div class="flex items-center gap-6">
-                        <div><h1 class="text-4xl font-black bg-gradient-to-r from-blue-400 via-emerald-400 to-purple-400 bg-clip-text text-transparent uppercase tracking-tighter">Pathfinder PRO</h1><p class="text-slate-500 text-sm mt-1 font-medium tracking-wide">Minecraft 拟人挂机系统 v2025</p></div>
-                        <button onclick="openAppCenter()" class="glass border border-white/10 px-5 py-2.5 rounded-2xl text-sm font-bold text-slate-300 hover:text-white hover:border-white/20 transition-all flex items-center gap-2 shadow-lg"><span class="text-lg">🚀</span> 应用中心</button>
-                    </div>
-                    <div class="glass p-2 rounded-2xl flex gap-2 w-full md:w-auto border border-white/10">
-                        <input id="h" placeholder="IP:PORT" class="input-dark rounded-xl px-4 py-2.5 text-sm text-white flex-1 md:w-48">
-                        <input id="u" placeholder="角色名" class="input-dark rounded-xl px-4 py-2.5 text-sm text-white md:w-36">
-                        <button onclick="addBot()" class="btn-primary text-white px-6 py-2.5 rounded-xl text-sm font-bold active:scale-95">部署角色</button>
-                    </div>
-                </header>
-                <div id="list" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6"></div>
-            </div>
-            <div id="mem-bar" class="fixed bottom-6 right-6 p-4 glass rounded-2xl flex items-center gap-4 z-40 shadow-2xl border border-white/10"><div class="flex flex-col items-center justify-center"><span id="mem-percent" class="text-xl font-black text-white tracking-tight">0.0%</span><span class="text-[9px] font-bold text-slate-500 uppercase tracking-widest">RAM</span></div><div class="w-28 h-2 bg-slate-800 rounded-full overflow-hidden shadow-inner"><div id="mem-progress" class="h-full bg-gradient-to-r from-blue-500 to-cyan-400 transition-all duration-700 rounded-full" style="width: 0%"></div></div></div>
-            <audio id="welcome-audio" preload="auto"><source src="https://raw.githubusercontent.com/outrzxy17145yy/-/main/welcome_voice.mp3" type="audio/mpeg"></audio>
+        <div id="mem-bar" class="fixed bottom-6 right-6 p-4 glass rounded-2xl flex items-center gap-4 z-40 shadow-2xl border border-white/10"><div class="flex flex-col items-center justify-center"><span id="mem-percent" class="text-xl font-black text-white tracking-tight">0.0%</span><span class="text-[9px] font-bold text-slate-500 uppercase tracking-widest">RAM</span></div><div class="w-28 h-2 bg-slate-800 rounded-full overflow-hidden shadow-inner"><div id="mem-progress" class="h-full bg-gradient-to-r from-blue-500 to-cyan-400 transition-all duration-700 rounded-full" style="width: 0%"></div></div></div>
+        <audio id="welcome-audio" preload="auto"><source src="https://raw.githubusercontent.com/outrzxy17145yy/-/main/welcome_voice.mp3" type="audio/mpeg"></audio>
 
-            <div id="modal-app-center" class="modal-overlay fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                <div class="modal-content glass rounded-3xl w-full max-w-2xl border border-white/10 shadow-2xl p-8 relative max-h-[90vh] overflow-y-auto log-box">
-                    <div id="view-list" class="view-section active-view">
-                        <div class="flex justify-between items-center mb-8"><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">🚀</span> 应用中心</h2><button onclick="closeAppCenter()" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button></div>
-                        <div class="grid grid-cols-2 gap-6">
-                            <div onclick="showView('ff')" class="cursor-pointer glass rounded-2xl p-8 border border-orange-500/20 hover:border-orange-500/60 transition-all flex flex-col items-center justify-center gap-4 group"><div class="w-20 h-20 bg-orange-500/20 rounded-2xl flex items-center justify-center text-5xl shadow-inner group-hover:scale-110 transition-transform">🦊</div><h3 class="font-bold text-lg text-slate-200 group-hover:text-orange-300 transition-colors">火狐浏览器</h3><p class="text-xs text-slate-500 text-center">支持固定隧道/临时隧道</p></div>
-                            <div onclick="showView('timer')" class="cursor-pointer glass rounded-2xl p-8 border border-blue-500/20 hover:border-blue-500/60 transition-all flex flex-col items-center justify-center gap-4 group"><div class="w-20 h-20 bg-blue-500/20 rounded-2xl flex items-center justify-center text-5xl shadow-inner group-hover:scale-110 transition-transform">⏱️</div><h3 class="font-bold text-lg text-slate-200 group-hover:text-blue-300 transition-colors">定时访问</h3><p class="text-xs text-slate-500 text-center">URL 保活定时器</p></div>
+        <div id="modal-app-center" class="modal-overlay fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div class="modal-content glass rounded-3xl w-full max-w-2xl border border-white/10 shadow-2xl p-8 relative max-h-[90vh] overflow-y-auto log-box">
+                <div id="view-list" class="view-section active-view">
+                    <div class="flex justify-between items-center mb-8"><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">🚀</span> 应用中心</h2><button onclick="closeAppCenter()" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button></div>
+                    <div class="grid grid-cols-2 gap-6">
+                        <div onclick="showView('ff')" class="cursor-pointer glass rounded-2xl p-8 border border-orange-500/20 hover:border-orange-500/60 transition-all flex flex-col items-center justify-center gap-4 group"><div class="w-20 h-20 bg-orange-500/20 rounded-2xl flex items-center justify-center text-5xl shadow-inner group-hover:scale-110 transition-transform">🦊</div><h3 class="font-bold text-lg text-slate-200 group-hover:text-orange-300 transition-colors">火狐浏览器</h3><p class="text-xs text-slate-500 text-center">支持固定隧道/临时隧道</p></div>
+                        <div onclick="showView('timer')" class="cursor-pointer glass rounded-2xl p-8 border border-blue-500/20 hover:border-blue-500/60 transition-all flex flex-col items-center justify-center gap-4 group"><div class="w-20 h-20 bg-blue-500/20 rounded-2xl flex items-center justify-center text-5xl shadow-inner group-hover:scale-110 transition-transform">⏱️</div><h3 class="font-bold text-lg text-slate-200 group-hover:text-blue-300 transition-colors">定时访问</h3><p class="text-xs text-slate-500 text-center">URL 保活定时器</p></div>
+                    </div>
+                </div>
+
+                <div id="view-ff" class="view-section">
+                    <div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button onclick="showView('list')" class="text-xl text-slate-400 hover:text-white transition-colors">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">🦊</span> 火狐浏览器</h2></div><button onclick="showView('list')" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button></div>
+                    <div class="bg-black/40 rounded-2xl p-5 border border-slate-800/50 flex flex-col gap-4">
+                        <div class="space-y-2 p-4 bg-black/20 rounded-2xl border border-slate-800/50">
+                            <p class="text-xs text-slate-400 font-bold mb-2">火狐配置 (留空使用默认值)</p>
+                            <div class="grid grid-cols-2 gap-2"><input id="ff-argo-domain" placeholder="ARGO_DOMAIN (固定隧道域名)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="ff-argo-auth" placeholder="ARGO_AUTH (Token/Json)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+                            <div class="grid grid-cols-2 gap-2"><input id="ff-pass" placeholder="密码 (默认 123456)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="ff-port" placeholder="端口 (默认 25889)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+                        </div>
+                        <div id="ff-url-box" class="hidden bg-cyan-500/10 border border-cyan-500/30 p-3 rounded-xl transition-all"><p class="text-[10px] text-cyan-400 font-bold mb-1">✅ CF隧道已就绪：</p><a id="ff-url-link" href="#" target="_blank" class="text-sm text-white font-mono underline break-all hover:text-cyan-300 transition-colors flex items-center gap-2"></a></div>
+                        <div class="bg-black/60 rounded-xl p-3 h-48 overflow-y-auto font-mono text-[10px] border border-white/5 shadow-inner log-box" id="ff-log-box"><div class="text-slate-500 opacity-50 text-center mt-16">等待操作...</div></div>
+                        <div class="grid grid-cols-3 gap-2">
+                            <button onclick="startFF()" id="ff-btn-start" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">▶️ 启动</button>
+                            <button onclick="stopFF()" id="ff-btn-stop" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">⏸️ 暂停</button>
+                            <button onclick="uninstallFF()" id="ff-btn-uninstall" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold text-red-400">🗑️ 卸载</button>
                         </div>
                     </div>
+                </div>
 
-                    <div id="view-ff" class="view-section">
-                        <div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button onclick="showView('list')" class="text-xl text-slate-400 hover:text-white transition-colors">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">🦊</span> 火狐浏览器</h2></div><button onclick="showView('list')" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button></div>
-                        <div class="bg-black/40 rounded-2xl p-5 border border-slate-800/50 flex flex-col gap-4">
-                            <div class="space-y-2 p-4 bg-black/20 rounded-2xl border border-slate-800/50">
-                                <p class="text-xs text-slate-400 font-bold mb-2">火狐配置 (留空使用默认值)</p>
-                                <div class="grid grid-cols-2 gap-2"><input id="ff-argo-domain" placeholder="ARGO_DOMAIN (固定隧道域名)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="ff-argo-auth" placeholder="ARGO_AUTH (Token/Json)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
-                                <div class="grid grid-cols-2 gap-2"><input id="ff-pass" placeholder="密码 (默认 123456)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="ff-port" placeholder="端口 (默认 25889)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
-                            </div>
-                            <div id="ff-url-box" class="hidden bg-cyan-500/10 border border-cyan-500/30 p-3 rounded-xl transition-all"><p class="text-[10px] text-cyan-400 font-bold mb-1">✅ CF隧道已就绪：</p><a id="ff-url-link" href="#" target="_blank" class="text-sm text-white font-mono underline break-all hover:text-cyan-300 transition-colors flex items-center gap-2"></a></div>
-                            <div class="bg-black/60 rounded-xl p-3 h-48 overflow-y-auto font-mono text-[10px] border border-white/5 shadow-inner log-box" id="ff-log-box"><div class="text-slate-500 opacity-50 text-center mt-16">等待操作...</div></div>
-                            <div class="grid grid-cols-3 gap-2">
-                                <button onclick="startFF()" id="ff-btn-start" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">▶️ 启动</button>
-                                <button onclick="stopFF()" id="ff-btn-stop" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">⏸️ 暂停</button>
-                                <button onclick="uninstallFF()" id="ff-btn-uninstall" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold text-red-400">🗑️ 卸载</button>
-                            </div>
+                <!-- 定时访问视图 -->
+                <div id="view-timer" class="view-section">
+                    <div class="flex justify-between items-center mb-6">
+                        <div class="flex items-center gap-3">
+                            <button onclick="showView('list')" class="text-xl text-slate-400 hover:text-white transition-colors">←</button>
+                            <h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">⏱️</span> 定时访问</h2>
                         </div>
+                        <button onclick="showView('list')" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button>
                     </div>
-
-                    <div id="view-timer" class="view-section">
-                        <div class="flex justify-between items-center mb-6">
-                            <div class="flex items-center gap-3">
-                                <button onclick="showView('list')" class="text-xl text-slate-400 hover:text-white transition-colors">←</button>
-                                <h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">⏱️</span> 定时访问</h2>
+                    <div class="space-y-6">
+                        <div class="grid grid-cols-3 gap-4">
+                            <div class="glass p-4 rounded-2xl border border-white/10 text-center">
+                                <div id="timer-total-urls" class="text-2xl font-bold text-white">0</div>
+                                <div class="text-xs text-slate-400">总URL数</div>
                             </div>
-                            <button onclick="showView('list')" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button>
+                            <div class="glass p-4 rounded-2xl border border-white/10 text-center">
+                                <div id="timer-active-urls" class="text-2xl font-bold text-emerald-400">0</div>
+                                <div class="text-xs text-slate-400">活跃URL</div>
+                            </div>
+                            <div class="glass p-4 rounded-2xl border border-white/10 text-center">
+                                <div id="timer-total-requests" class="text-2xl font-bold text-blue-400">0</div>
+                                <div class="text-xs text-slate-400">总请求数</div>
+                            </div>
                         </div>
-                        <div class="space-y-6">
-                            <div class="grid grid-cols-3 gap-4">
-                                <div class="glass p-4 rounded-2xl border border-white/10 text-center">
-                                    <div id="timer-total-urls" class="text-2xl font-bold text-white">0</div>
-                                    <div class="text-xs text-slate-400">总URL数</div>
-                                </div>
-                                <div class="glass p-4 rounded-2xl border border-white/10 text-center">
-                                    <div id="timer-active-urls" class="text-2xl font-bold text-emerald-400">0</div>
-                                    <div class="text-xs text-slate-400">活跃URL</div>
-                                </div>
-                                <div class="glass p-4 rounded-2xl border border-white/10 text-center">
-                                    <div id="timer-total-requests" class="text-2xl font-bold text-blue-400">0</div>
-                                    <div class="text-xs text-slate-400">总请求数</div>
-                                </div>
+                        <div class="bg-black/40 rounded-2xl p-5 border border-slate-800/50">
+                            <div class="flex gap-2 mb-4">
+                                <button id="show-single-add" class="toggle-btn bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white py-2 px-4 rounded-xl text-xs font-bold" onclick="timerUI.toggleAddMode('single')">单个添加</button>
+                                <button id="show-batch-add" class="toggle-btn off py-2 px-4 rounded-xl text-xs font-bold" onclick="timerUI.toggleAddMode('batch')">批量添加</button>
                             </div>
-                            <div class="bg-black/40 rounded-2xl p-5 border border-slate-800/50">
-                                <div class="flex gap-2 mb-4">
-                                    <button id="show-single-add" class="toggle-btn bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white py-2 px-4 rounded-xl text-xs font-bold" onclick="timerUI.toggleAddMode('single')">单个添加</button>
-                                    <button id="show-batch-add" class="toggle-btn off py-2 px-4 rounded-xl text-xs font-bold" onclick="timerUI.toggleAddMode('batch')">批量添加</button>
-                                </div>
-                                <div id="single-add-form" class="space-y-3">
-                                    <input id="timer-single-url" placeholder="https://example.com" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
-                                    <div class="grid grid-cols-2 gap-3">
-                                        <input id="timer-single-desc" placeholder="备注（可选）" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
-                                        <select id="timer-single-mode" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white bg-slate-900">
-                                            <option value="24h">24小时访问</option>
-                                            <option value="scheduled">定时访问(1:00-6:00停)</option>
-                                        </select>
-                                    </div>
-                                    <div class="flex gap-2">
-                                        <button onclick="timerUI.addSingle()" class="btn-primary text-white px-4 py-2 rounded-xl text-xs font-bold">保存</button>
-                                        <button onclick="document.getElementById('timer-single-url').value='';document.getElementById('timer-single-desc').value=''" class="toggle-btn off px-4 py-2 rounded-xl text-xs font-bold">取消</button>
-                                    </div>
-                                </div>
-                                <div id="batch-add-form" class="space-y-3 hidden">
-                                    <textarea id="timer-batch-urls" rows="4" placeholder="每行一个URL，格式：URL|备注（可选）" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></textarea>
-                                    <div class="grid grid-cols-2 gap-3">
-                                        <select id="timer-batch-mode" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white bg-slate-900">
-                                            <option value="24h">24小时访问</option>
-                                            <option value="scheduled">定时访问(1:00-6:00停)</option>
-                                        </select>
-                                        <button onclick="timerUI.previewBatch()" class="toggle-btn off py-2 px-4 rounded-xl text-xs font-bold">预览</button>
-                                    </div>
-                                    <div class="flex gap-2">
-                                        <button onclick="timerUI.addBatch()" class="btn-primary text-white px-4 py-2 rounded-xl text-xs font-bold">批量保存</button>
-                                    </div>
-                                </div>
-                            </div>
-                            <div>
-                                <h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider mb-3">URL 列表</h3>
-                                <div id="timer-urls-list" class="space-y-2 max-h-64 overflow-y-auto log-box bg-black/60 rounded-2xl p-4 border border-slate-800/50"></div>
-                            </div>
-                            <div>
-                                <div class="flex justify-between items-center mb-3">
-                                    <h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider">访问日志（仅保留最近2小时）</h3>
-                                    <div class="flex gap-2">
-                                        <button onclick="timerUI.loadLogs()" class="toggle-btn off py-1 px-3 rounded-xl text-xs font-bold">刷新</button>
-                                        <button onclick="timerUI.clearLogs()" class="toggle-btn off py-1 px-3 rounded-xl text-xs font-bold text-red-400">清空</button>
-                                    </div>
-                                </div>
-                                <div class="flex gap-3 mb-2">
-                                    <input id="timer-log-date" type="date" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white" onchange="timerUI.loadLogs()">
-                                    <select id="timer-log-status" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white bg-slate-900" onchange="timerUI.loadLogs()">
-                                        <option value="">全部状态</option>
-                                        <option value="success">成功</option>
-                                        <option value="error">错误</option>
+                            <div id="single-add-form" class="space-y-3">
+                                <input id="timer-single-url" placeholder="https://example.com" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
+                                <div class="grid grid-cols-2 gap-3">
+                                    <input id="timer-single-desc" placeholder="备注（可选）" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
+                                    <select id="timer-single-mode" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white bg-slate-900">
+                                        <option value="24h">24小时访问</option>
+                                        <option value="scheduled">定时访问(1:00-6:00停)</option>
                                     </select>
-                                    <input id="timer-log-urlfilter" placeholder="URL关键词" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white" oninput="timerUI.loadLogs()">
                                 </div>
-                                <div id="timer-logs-list" class="space-y-1 max-h-48 overflow-y-auto log-box bg-black/60 rounded-2xl p-3 border border-slate-800/50 text-xs"></div>
+                                <div class="flex gap-2">
+                                    <button onclick="timerUI.addSingle()" class="btn-primary text-white px-4 py-2 rounded-xl text-xs font-bold">保存</button>
+                                    <button onclick="document.getElementById('timer-single-url').value='';document.getElementById('timer-single-desc').value=''" class="toggle-btn off px-4 py-2 rounded-xl text-xs font-bold">取消</button>
+                                </div>
                             </div>
+                            <div id="batch-add-form" class="space-y-3 hidden">
+                                <textarea id="timer-batch-urls" rows="4" placeholder="每行一个URL，格式：URL|备注（可选）" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></textarea>
+                                <div class="grid grid-cols-2 gap-3">
+                                    <select id="timer-batch-mode" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white bg-slate-900">
+                                        <option value="24h">24小时访问</option>
+                                        <option value="scheduled">定时访问(1:00-6:00停)</option>
+                                    </select>
+                                    <button onclick="timerUI.previewBatch()" class="toggle-btn off py-2 px-4 rounded-xl text-xs font-bold">预览</button>
+                                </div>
+                                <div class="flex gap-2">
+                                    <button onclick="timerUI.addBatch()" class="btn-primary text-white px-4 py-2 rounded-xl text-xs font-bold">批量保存</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider mb-3">URL 列表</h3>
+                            <div id="timer-urls-list" class="space-y-2 max-h-64 overflow-y-auto log-box bg-black/60 rounded-2xl p-4 border border-slate-800/50"></div>
+                        </div>
+                        <div>
+                            <div class="flex justify-between items-center mb-3">
+                                <h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider">访问日志（仅保留最近2小时）</h3>
+                                <div class="flex gap-2">
+                                    <button onclick="timerUI.loadLogs()" class="toggle-btn off py-1 px-3 rounded-xl text-xs font-bold">刷新</button>
+                                    <button onclick="timerUI.clearLogs()" class="toggle-btn off py-1 px-3 rounded-xl text-xs font-bold text-red-400">清空</button>
+                                </div>
+                            </div>
+                            <div class="flex gap-3 mb-2">
+                                <input id="timer-log-date" type="date" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white" onchange="timerUI.loadLogs()">
+                                <select id="timer-log-status" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white bg-slate-900" onchange="timerUI.loadLogs()">
+                                    <option value="">全部状态</option>
+                                    <option value="success">成功</option>
+                                    <option value="error">错误</option>
+                                </select>
+                                <input id="timer-log-urlfilter" placeholder="URL关键词" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white" oninput="timerUI.loadLogs()">
+                            </div>
+                            <div id="timer-logs-list" class="space-y-1 max-h-48 overflow-y-auto log-box bg-black/60 rounded-2xl p-3 border border-slate-800/50 text-xs"></div>
                         </div>
                     </div>
                 </div>
@@ -362,192 +320,160 @@ app.get("/", (req, res) => {
         </div>
 
         <script>
-            const tokenKey = 'authToken';
-            function getToken() { return localStorage.getItem(tokenKey); }
-            async function doLogin() {
-                const pwd = document.getElementById('login-password').value;
-                const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: pwd }) });
-                const data = await res.json();
-                if (data.success) {
-                    localStorage.setItem(tokenKey, data.token);
-                    document.getElementById('login-overlay').classList.add('hidden');
-                    document.getElementById('main-content').classList.remove('hidden');
-                    initMain();
-                } else {
-                    document.getElementById('login-error').classList.remove('hidden');
-                }
-            }
+            let drafts = {}; function saveDraft(botId, field, val) { if (!drafts[botId]) drafts[botId] = {}; drafts[botId][field] = val; } function getDraft(botId, field, fallback) { return (drafts[botId] && drafts[botId][field] !== undefined) ? drafts[botId][field] : (fallback || ''); }
+            function showView(viewId) { document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view')); document.getElementById('view-' + viewId).classList.add('active-view'); if(viewId === 'ff') loadFFStatus(); if(viewId === 'timer') timerUI.refresh(); }
+            function openAppCenter() { document.getElementById('modal-app-center').classList.add('active'); showView('list'); }
+            function closeAppCenter() { document.getElementById('modal-app-center').classList.remove('active'); }
 
-            (async function() {
-                const token = getToken();
-                if (token) {
-                    const res = await fetch('/api/system/status', { headers: { 'Authorization': 'Bearer ' + token } });
-                    if (res.ok) {
-                        document.getElementById('login-overlay').classList.add('hidden');
-                        document.getElementById('main-content').classList.remove('hidden');
-                        initMain();
-                        return;
-                    }
-                }
-                document.getElementById('login-overlay').classList.remove('hidden');
-            })();
+            async function loadFFStatus() { try { const r = await fetch('/api/apps/firefox/status'); const d = await r.json(); const isRun = d.running; document.getElementById('ff-btn-start').className = \`toggle-btn \${isRun?'off opacity-50':'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white'} py-2.5 rounded-xl text-xs font-bold\`; document.getElementById('ff-btn-stop').className = \`toggle-btn \${isRun?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off opacity-50'} py-2.5 rounded-xl text-xs font-bold\`; if(d.url) { document.getElementById('ff-url-box').classList.remove('hidden'); document.getElementById('ff-url-link').href = d.url; document.getElementById('ff-url-link').innerHTML = \`🔗 \${d.url}\`; } else { document.getElementById('ff-url-box').classList.add('hidden'); } document.getElementById('ff-log-box').innerHTML = d.logs.length > 0 ? d.logs.map(l => \`<div class="mb-1 \${l.color} flex"><span class="opacity-30 mr-2 shrink-0 select-none">[\${l.time}]</span><span>\${l.msg}</span></div>\`).join('') : '<div class="text-slate-500 opacity-50 text-center mt-16">等待操作...</div>'; } catch(e){} }
+            async function startFF() { const params = { FF_PASS: document.getElementById('ff-pass').value, FF_PORT: document.getElementById('ff-port').value, ARGO_DOMAIN: document.getElementById('ff-argo-domain').value, ARGO_AUTH: document.getElementById('ff-argo-auth').value }; await fetch('/api/apps/firefox/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ params }) }); loadFFStatus(); }
+            async function stopFF() { await fetch('/api/apps/firefox/stop', { method: 'POST' }); loadFFStatus(); }
+            async function uninstallFF() { if(!confirm('确认卸载？将清除所有下载的文件！')) return; await fetch('/api/apps/firefox/uninstall', { method: 'DELETE' }); loadFFStatus(); }
 
-            function authFetch(url, options = {}) {
-                const token = getToken();
-                if (!token) throw new Error('未登录');
-                const headers = options.headers || {};
-                headers['Authorization'] = 'Bearer ' + token;
-                return fetch(url, { ...options, headers });
-            }
+            // 定时访问 UI 逻辑
+            window.timerUI = {
+                currentAddMode: 'single',
+                toggleAddMode(mode) {
+                    this.currentAddMode = mode;
+                    document.getElementById('single-add-form').classList.toggle('hidden', mode !== 'single');
+                    document.getElementById('batch-add-form').classList.toggle('hidden', mode !== 'batch');
+                    document.getElementById('show-single-add').className = mode === 'single' ? 'toggle-btn bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white py-2 px-4 rounded-xl text-xs font-bold' : 'toggle-btn off py-2 px-4 rounded-xl text-xs font-bold';
+                    document.getElementById('show-batch-add').className = mode === 'batch' ? 'toggle-btn bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white py-2 px-4 rounded-xl text-xs font-bold' : 'toggle-btn off py-2 px-4 rounded-xl text-xs font-bold';
+                },
+                async refresh() {
+                    const statsRes = await fetch('/api/timer/stats');
+                    const stats = await statsRes.json();
+                    document.getElementById('timer-total-urls').innerText = stats.total;
+                    document.getElementById('timer-active-urls').innerText = stats.active;
+                    document.getElementById('timer-total-requests').innerText = stats.totalRequests;
 
-            function initMain() {
-                let drafts = {};
-                function saveDraft(botId, field, val) { if (!drafts[botId]) drafts[botId] = {}; drafts[botId][field] = val; }
-                function getDraft(botId, field, fallback) { return (drafts[botId] && drafts[botId][field] !== undefined) ? drafts[botId][field] : (fallback || ''); }
-                function showView(viewId) { document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view')); const target = document.getElementById('view-' + viewId); if (target) target.classList.add('active-view'); if(viewId === 'ff') loadFFStatus(); if(viewId === 'timer') timerUI.refresh(); }
-                function openAppCenter() { document.getElementById('modal-app-center').classList.add('active'); showView('list'); }
-                function closeAppCenter() { document.getElementById('modal-app-center').classList.remove('active'); }
-
-                async function loadFFStatus() { try { const r = await authFetch('/api/apps/firefox/status'); const d = await r.json(); const isRun = d.running; document.getElementById('ff-btn-start').className = \`toggle-btn \${isRun?'off opacity-50':'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white'} py-2.5 rounded-xl text-xs font-bold\`; document.getElementById('ff-btn-stop').className = \`toggle-btn \${isRun?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off opacity-50'} py-2.5 rounded-xl text-xs font-bold\`; if(d.url) { document.getElementById('ff-url-box').classList.remove('hidden'); document.getElementById('ff-url-link').href = d.url; document.getElementById('ff-url-link').innerHTML = \`🔗 \${d.url}\`; } else { document.getElementById('ff-url-box').classList.add('hidden'); } document.getElementById('ff-log-box').innerHTML = d.logs.length > 0 ? d.logs.map(l => \`<div class="mb-1 \${l.color} flex"><span class="opacity-30 mr-2 shrink-0 select-none">[\${l.time}]</span><span>\${l.msg}</span></div>\`).join('') : '<div class="text-slate-500 opacity-50 text-center mt-16">等待操作...</div>'; } catch(e){} }
-                async function startFF() { const params = { FF_PASS: document.getElementById('ff-pass').value, FF_PORT: document.getElementById('ff-port').value, ARGO_DOMAIN: document.getElementById('ff-argo-domain').value, ARGO_AUTH: document.getElementById('ff-argo-auth').value }; await authFetch('/api/apps/firefox/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ params }) }); loadFFStatus(); }
-                async function stopFF() { await authFetch('/api/apps/firefox/stop', { method: 'POST' }); loadFFStatus(); }
-                async function uninstallFF() { if(!confirm('确认卸载？将清除所有下载的文件！')) return; await authFetch('/api/apps/firefox/uninstall', { method: 'DELETE' }); loadFFStatus(); }
-
-                window.timerUI = {
-                    currentAddMode: 'single',
-                    toggleAddMode(mode) {
-                        this.currentAddMode = mode;
-                        document.getElementById('single-add-form').classList.toggle('hidden', mode !== 'single');
-                        document.getElementById('batch-add-form').classList.toggle('hidden', mode !== 'batch');
-                        document.getElementById('show-single-add').className = mode === 'single' ? 'toggle-btn bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white py-2 px-4 rounded-xl text-xs font-bold' : 'toggle-btn off py-2 px-4 rounded-xl text-xs font-bold';
-                        document.getElementById('show-batch-add').className = mode === 'batch' ? 'toggle-btn bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white py-2 px-4 rounded-xl text-xs font-bold' : 'toggle-btn off py-2 px-4 rounded-xl text-xs font-bold';
-                    },
-                    async refresh() {
-                        const statsRes = await authFetch('/api/timer/stats');
-                        const stats = await statsRes.json();
-                        document.getElementById('timer-total-urls').innerText = stats.total;
-                        document.getElementById('timer-active-urls').innerText = stats.active;
-                        document.getElementById('timer-total-requests').innerText = stats.totalRequests;
-                        const urlsRes = await authFetch('/api/timer/urls');
-                        const urlsData = await urlsRes.json();
-                        const list = document.getElementById('timer-urls-list');
-                        list.innerHTML = urlsData.urls.map(u => \`
-                            <div class="flex items-center justify-between bg-slate-900/60 rounded-xl p-3 border border-slate-800/50">
-                                <div class="flex-1 min-w-0">
-                                    <div class="text-xs font-bold text-white truncate">\${u.url}</div>
-                                    <div class="text-[10px] text-slate-400">\${u.description || ''} · \${u.mode === '24h' ? '24H' : '定时'}</div>
-                                </div>
-                                <div class="flex items-center gap-2 ml-2">
-                                    <span class="text-[10px] \${u.enabled ? 'text-emerald-400' : 'text-red-400'}">\${u.enabled ? '活跃' : '禁用'}</span>
-                                    <button onclick="timerUI.editUrl(\${u.id})" class="text-slate-400 hover:text-white text-xs">✎</button>
-                                    <button onclick="timerUI.toggleUrl(\${u.id})" class="text-slate-400 hover:text-white text-xs">\${u.enabled ? '⏸' : '▶'}</button>
-                                    <button onclick="timerUI.deleteUrl(\${u.id})" class="text-slate-400 hover:text-red-400 text-xs">✕</button>
-                                </div>
+                    const urlsRes = await fetch('/api/timer/urls');
+                    const urlsData = await urlsRes.json();
+                    const list = document.getElementById('timer-urls-list');
+                    list.innerHTML = urlsData.urls.map(u => \`
+                        <div class="flex items-center justify-between bg-slate-900/60 rounded-xl p-3 border border-slate-800/50">
+                            <div class="flex-1 min-w-0">
+                                <div class="text-xs font-bold text-white truncate">\${u.url}</div>
+                                <div class="text-[10px] text-slate-400">\${u.description || ''} · \${u.mode === '24h' ? '24H' : '定时'}</div>
                             </div>
-                        \`).join('');
-                        this.loadLogs();
-                    },
-                    async loadLogs() {
-                        const date = document.getElementById('timer-log-date')?.value || '';
-                        const status = document.getElementById('timer-log-status')?.value || '';
-                        const urlFilter = document.getElementById('timer-log-urlfilter')?.value || '';
-                        const res = await authFetch(\`/api/timer/logs?date=\${date}&status=\${status}&urlFilter=\${encodeURIComponent(urlFilter)}\`);
-                        const data = await res.json();
-                        const logsDiv = document.getElementById('timer-logs-list');
-                        logsDiv.innerHTML = data.logs.map(l => {
-                            let statusClass = 'text-slate-400';
-                            if (l.statusCode >= 200 && l.statusCode < 400) statusClass = 'text-emerald-400';
-                            else if (l.statusCode === 'ERROR' || l.statusCode >= 400) statusClass = 'text-red-400';
-                            const time = new Date(l.time).toLocaleString('zh-CN');
-                            return \`<div class="flex items-center justify-between text-[10px]">
-                                <span class="truncate flex-1">\${l.url}</span>
-                                <span class="\${statusClass} mx-2">\${l.statusCode}</span>
-                                <span class="text-slate-500">\${l.message}</span>
-                                <span class="ml-2 text-slate-500">\${time}</span>
-                            </div>\`;
-                        }).join('');
-                    },
-                    async addSingle() {
-                        const url = document.getElementById('timer-single-url').value.trim();
-                        if (!url) return alert('请输入URL');
-                        const desc = document.getElementById('timer-single-desc').value.trim();
-                        const mode = document.getElementById('timer-single-mode').value;
-                        await authFetch('/api/timer/urls', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ url, description: desc, mode, enabled: true }) });
-                        document.getElementById('timer-single-url').value = '';
-                        document.getElementById('timer-single-desc').value = '';
-                        this.refresh();
-                    },
-                    async addBatch() {
-                        const text = document.getElementById('timer-batch-urls').value.trim();
-                        if (!text) return alert('请输入URL列表');
-                        const lines = text.split('\\n').filter(l => l.trim());
-                        const mode = document.getElementById('timer-batch-mode').value;
-                        await authFetch('/api/timer/urls', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ batchUrls: lines, batchMode: mode, batchEnabled: true }) });
-                        document.getElementById('timer-batch-urls').value = '';
-                        this.refresh();
-                    },
-                    async previewBatch() { const text = document.getElementById('timer-batch-urls').value.trim(); if (!text) return alert('无内容'); const lines = text.split('\\n').filter(l => l.trim()); alert('预览 ' + lines.length + ' 个URL即将添加'); },
-                    async deleteUrl(id) { if (!confirm('确定删除此URL？')) return; await authFetch('/api/timer/urls/' + id, { method: 'DELETE' }); this.refresh(); },
-                    async toggleUrl(id) { await authFetch('/api/timer/urls/' + id + '/toggle', { method: 'POST' }); this.refresh(); },
-                    async editUrl(id) {
-                        const res = await authFetch('/api/timer/urls');
-                        const data = await res.json();
-                        const urlItem = data.urls.find(u => u.id === id);
-                        if (!urlItem) return;
-                        const newUrl = prompt('修改URL地址', urlItem.url);
-                        if (newUrl !== null) {
-                            const newDesc = prompt('修改备注', urlItem.description || '');
-                            const newMode = prompt('访问模式 (24h 或 scheduled)', urlItem.mode);
-                            await authFetch('/api/timer/urls/' + id, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ url: newUrl, description: newDesc, mode: newMode || urlItem.mode }) });
-                            this.refresh();
-                        }
-                    },
-                    async clearLogs() { if (!confirm('确定清空所有日志和统计？')) return; await authFetch('/api/timer/logs', { method: 'DELETE' }); this.refresh(); }
-                };
-
-                async function updateSystemStatus() { try { const r = await authFetch('/api/system/status'); const d = await r.json(); document.getElementById('mem-percent').innerText = d.percent + '%'; document.getElementById('mem-progress').style.width = d.percent + '%'; const prog = document.getElementById('mem-progress'); if(parseFloat(d.percent) > 80) prog.className = "h-full bg-gradient-to-r from-red-500 to-orange-400 transition-all duration-700 rounded-full"; else prog.className = "h-full bg-gradient-to-r from-blue-500 to-cyan-400 transition-all duration-700 rounded-full"; } catch(e){} }
-                async function uploadFile(botId, input) { if (!input.files[0]) return; const formData = new FormData(); formData.append('file', input.files[0]); const res = await authFetch(\`/api/bots/\${botId}/upload\`, { method: 'POST', body: formData }); alert(res.ok ? '✅ 同步成功' : '❌ 同步失败'); input.value = ''; }
-                async function addBot() { await authFetch('/api/bots', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ host: document.getElementById('h').value, username: document.getElementById('u').value }) }); updateUI(true); }
-                async function restartNow(id) { await authFetch('/api/bots/'+id+'/restart-now', { method: 'POST' }); updateUI(true); }
-                async function setTimer(id, value, unit) { await authFetch('/api/bots/'+id+'/set-timer', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ value, unit }) }); updateUI(true); }
-                async function savePto(id) { const data = { url: document.getElementById('url-'+id).value, id: document.getElementById('sid-'+id).value, key: document.getElementById('key-'+id).value, defaultDir: document.getElementById('ddir-'+id).value }; await authFetch('/api/bots/'+id+'/pto-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) }); updateUI(true); }
-                async function toggleGuard(id) { await authFetch('/api/bots/'+id+'/toggle-guard', { method: 'POST' }); updateUI(true); }
-                async function toggle(id, type) { await authFetch('/api/bots/'+id+'/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ type }) }); updateUI(true); }
-                async function removeBot(id) { if(confirm('确认移除？')) { await authFetch('/api/bots/'+id, { method: 'DELETE' }); updateUI(true); } }
-
-                async function updateUI(force = false) {
-                    if (!force && document.activeElement && document.activeElement.tagName === 'INPUT') return;
-                    const openDetails = Array.from(document.querySelectorAll('details[open]')).map(el => el.id);
-                    const r = await authFetch('/api/bots'); const d = await r.json();
-                    document.getElementById('list').innerHTML = d.bots.map(b => \`<div class="glass rounded-3xl overflow-hidden border-t-4 \${b.status==='在线'?'border-emerald-500':'border-red-500'} card-hover flex flex-col bot-card">
-                        <div class="p-6 flex-1 flex flex-col gap-4">
-                            <div class="flex justify-between items-center">
-                                <div><div class="flex items-center gap-2.5"><h3 class="text-xl font-extrabold tracking-tight">\${b.username}</h3><span class="px-2.5 py-1 rounded-full text-[10px] font-bold flex items-center gap-1.5 \${b.status==='在线'?'bg-emerald-500/20 text-emerald-400':'bg-red-500/20 text-red-400'}"><span class="status-dot \${b.status==='在线'?'online':'offline'}"></span>\${b.status}</span></div><p class="text-xs text-slate-500 mt-1 font-medium">\${b.host}:\${b.port}</p></div><button onclick="removeBot('\${b.id}')" class="w-8 h-8 rounded-full bg-slate-800 hover:bg-red-600 hover:text-white text-slate-500 transition-colors flex items-center justify-center text-sm font-bold shadow-inner">✕</button>
+                            <div class="flex items-center gap-2 ml-2">
+                                <span class="text-[10px] \${u.enabled ? 'text-emerald-400' : 'text-red-400'}">\${u.enabled ? '活跃' : '禁用'}</span>
+                                <button onclick="timerUI.editUrl(\${u.id})" class="text-slate-400 hover:text-white text-xs">✎</button>
+                                <button onclick="timerUI.toggleUrl(\${u.id})" class="text-slate-400 hover:text-white text-xs">\${u.enabled ? '⏸' : '▶'}</button>
+                                <button onclick="timerUI.deleteUrl(\${u.id})" class="text-slate-400 hover:text-red-400 text-xs">✕</button>
                             </div>
-                            <div class="log-box bg-black/60 rounded-2xl p-4 h-40 overflow-y-auto font-mono text-[11px] border border-slate-800/50 shadow-inner">\${b.logs.map(l => \`<div class="mb-1.5 \${l.color} flex"><span class="opacity-30 mr-2 shrink-0 select-none">[\${l.time}]</span><span>\${l.msg}</span></div>\`).join('')}</div>
-                            <div class="grid grid-cols-3 gap-2">
-                                <button onclick="toggle('\${b.id}','ai')" class="toggle-btn \${b.settings.ai?'bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">👁️ AI视角</button>
-                                <button onclick="toggle('\${b.id}','walk')" class="toggle-btn \${b.settings.walk?'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">👣 巡逻</button>
-                                <button onclick="toggle('\${b.id}','chat')" class="toggle-btn \${b.settings.chat?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">💬 喊话</button>
-                            </div>
-                            <div class="bg-slate-900/60 p-4 rounded-2xl border border-slate-800/50">
-                                <div class="flex justify-between items-center mb-3"><h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider">重启序列</h4><span class="text-[10px] text-slate-500">下次: <span class="text-cyan-400 font-semibold">\${b.nextRestart}</span></span></div>
-                                <div class="grid grid-cols-2 gap-2 mb-3">
-                                    <div><input id="min-\${b.id}" type="number" placeholder="分钟" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><button onclick="setTimer('\${b.id}', document.getElementById('min-\${b.id}').value, 'min')" class="mt-1.5 w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-[10px] font-bold transition-colors">设定分钟</button></div>
-                                    <div><input id="hour-\${b.id}" type="number" placeholder="小时" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><button onclick="setTimer('\${b.id}', document.getElementById('hour-\${b.id}').value, 'hour')" class="mt-1.5 w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-[10px] font-bold transition-colors">设定小时</button></div>
-                                </div>
-                                <button onclick="restartNow('\${b.id}')" class="btn-danger w-full py-2.5 rounded-xl text-xs font-bold uppercase active:scale-95 transition-all">⚡ 立即重启</button>
-                            </div>
-                            <details id="pto-\${b.id}" class="group"><summary class="flex justify-between items-center cursor-pointer list-none bg-slate-900/60 p-3 rounded-2xl border border-slate-800/50 hover:border-slate-700 transition-colors"><span class="text-xs font-bold text-slate-400 uppercase tracking-wider">🦖 翼龙同步</span><span class="transition group-open:rotate-180 text-slate-500 text-xs">▼</span></summary><div class="mt-2 space-y-2 p-3 bg-slate-900/60 rounded-2xl border border-slate-800/50"><input oninput="saveDraft('\${b.id}', 'url', this.value)" id="url-\${b.id}" placeholder="面板地址" value="\${getDraft(b.id, 'url', b.settings.pterodactyl?.url)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="grid grid-cols-2 gap-2"><input oninput="saveDraft('\${b.id}', 'sid', this.value)" id="sid-\${b.id}" placeholder="服务器 ID" value="\${getDraft(b.id, 'sid', b.settings.pterodactyl?.id)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input oninput="saveDraft('\${b.id}', 'ddir', this.value)" id="ddir-\${b.id}" placeholder="目录 (默认/)" value="\${getDraft(b.id, 'ddir', b.settings.pterodactyl?.defaultDir)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-emerald-400"></div><input oninput="saveDraft('\${b.id}', 'key', this.value)" id="key-\${b.id}" type="password" placeholder="API Key" value="\${getDraft(b.id, 'key', b.settings.pterodactyl?.key)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="grid grid-cols-2 gap-2 pt-1"><button onclick="savePto('\${b.id}')" class="bg-slate-800 hover:bg-slate-700 text-[10px] py-2.5 rounded-xl font-bold transition-colors">💾 保存凭据</button><button onclick="document.getElementById('f-\${b.id}').click()" class="btn-primary text-[10px] py-2.5 rounded-xl font-bold">🚀 同步文件</button><input type="file" id="f-\${b.id}" class="hidden" onchange="uploadFile('\${b.id}', this)"></div><button onclick="toggleGuard('\${b.id}')" class="toggle-btn \${b.settings.pterodactyl?.guard?'bg-indigo-600/90 shadow-lg shadow-indigo-500/30 text-white':'off'} w-full py-2.5 rounded-xl text-[10px] font-bold mt-2">🛡️ 守护 \${b.settings.pterodactyl?.guard?'开启':'关闭'}</button></div></details>
                         </div>
-                    </div>\`).join('');
-                    openDetails.forEach(id => { const el = document.getElementById(id); if (el) el.open = true; });
-                }
+                    \`).join('');
+                    this.loadLogs();
+                },
+                async loadLogs() {
+                    const date = document.getElementById('timer-log-date')?.value || '';
+                    const status = document.getElementById('timer-log-status')?.value || '';
+                    const urlFilter = document.getElementById('timer-log-urlfilter')?.value || '';
+                    const res = await fetch(\`/api/timer/logs?date=\${date}&status=\${status}&urlFilter=\${encodeURIComponent(urlFilter)}\`);
+                    const data = await res.json();
+                    const logsDiv = document.getElementById('timer-logs-list');
+                    logsDiv.innerHTML = data.logs.map(l => {
+                        let statusClass = 'text-slate-400';
+                        if (l.statusCode >= 200 && l.statusCode < 400) statusClass = 'text-emerald-400';
+                        else if (l.statusCode === 'ERROR' || l.statusCode >= 400) statusClass = 'text-red-400';
+                        const time = new Date(l.time).toLocaleString('zh-CN');
+                        return \`<div class="flex items-center justify-between text-[10px]">
+                            <span class="truncate flex-1">\${l.url}</span>
+                            <span class="\${statusClass} mx-2">\${l.statusCode}</span>
+                            <span class="text-slate-500">\${l.message}</span>
+                            <span class="ml-2 text-slate-500">\${time}</span>
+                        </div>\`;
+                    }).join('');
+                },
+                async addSingle() {
+                    const url = document.getElementById('timer-single-url').value.trim();
+                    if (!url) return alert('请输入URL');
+                    const desc = document.getElementById('timer-single-desc').value.trim();
+                    const mode = document.getElementById('timer-single-mode').value;
+                    await fetch('/api/timer/urls', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url, description: desc, mode, enabled: true })
+                    });
+                    document.getElementById('timer-single-url').value = '';
+                    document.getElementById('timer-single-desc').value = '';
+                    this.refresh();
+                },
+                async addBatch() {
+                    const text = document.getElementById('timer-batch-urls').value.trim();
+                    if (!text) return alert('请输入URL列表');
+                    const lines = text.split('\\n').filter(l => l.trim());
+                    const mode = document.getElementById('timer-batch-mode').value;
+                    await fetch('/api/timer/urls', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ batchUrls: lines, batchMode: mode, batchEnabled: true })
+                    });
+                    document.getElementById('timer-batch-urls').value = '';
+                    this.refresh();
+                },
+                async previewBatch() { const text = document.getElementById('timer-batch-urls').value.trim(); if (!text) return alert('无内容'); const lines = text.split('\\n').filter(l => l.trim()); alert('预览 ' + lines.length + ' 个URL即将添加'); },
+                async deleteUrl(id) { if (!confirm('确定删除此URL？')) return; await fetch('/api/timer/urls/' + id, { method: 'DELETE' }); this.refresh(); },
+                async toggleUrl(id) { await fetch('/api/timer/urls/' + id + '/toggle', { method: 'POST' }); this.refresh(); },
+                async editUrl(id) {
+                    const res = await fetch('/api/timer/urls');
+                    const data = await res.json();
+                    const urlItem = data.urls.find(u => u.id === id);
+                    if (!urlItem) return;
+                    const newUrl = prompt('修改URL地址', urlItem.url);
+                    if (newUrl !== null) {
+                        const newDesc = prompt('修改备注', urlItem.description || '');
+                        const newMode = prompt('访问模式 (24h 或 scheduled)', urlItem.mode);
+                        await fetch('/api/timer/urls/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: newUrl, description: newDesc, mode: newMode || urlItem.mode }) });
+                        this.refresh();
+                    }
+                },
+                async clearLogs() { if (!confirm('确定清空所有日志和统计？')) return; await fetch('/api/timer/logs', { method: 'DELETE' }); this.refresh(); }
+            };
 
-                const welcomeAudio = document.getElementById('welcome-audio'); welcomeAudio.volume = 0.8; let playPromise = welcomeAudio.play(); if (playPromise !== undefined) { playPromise.catch(() => { const playOnInteraction = () => { welcomeAudio.play(); document.removeEventListener('click', playOnInteraction); document.removeEventListener('keydown', playOnInteraction); }; document.addEventListener('click', playOnInteraction); document.addEventListener('keydown', playOnInteraction); }); }
-                setInterval(() => { updateUI(false); updateSystemStatus(); const modal = document.getElementById('modal-app-center'); if(modal.classList.contains('active')) { if(document.getElementById('view-ff') && document.getElementById('view-ff').classList.contains('active-view')) loadFFStatus(); } }, 3000);
-                updateUI(true);
+            async function updateSystemStatus() { try { const r = await fetch('/api/system/status'); const d = await r.json(); document.getElementById('mem-percent').innerText = d.percent + '%'; document.getElementById('mem-progress').style.width = d.percent + '%'; const prog = document.getElementById('mem-progress'); if(parseFloat(d.percent) > 80) prog.className = "h-full bg-gradient-to-r from-red-500 to-orange-400 transition-all duration-700 rounded-full"; else prog.className = "h-full bg-gradient-to-r from-blue-500 to-cyan-400 transition-all duration-700 rounded-full"; } catch(e){} }
+            async function uploadFile(botId, input) { if (!input.files[0]) return; const formData = new FormData(); formData.append('file', input.files[0]); const res = await fetch(\`/api/bots/\${botId}/upload\`, { method: 'POST', body: formData }); alert(res.ok ? '✅ 同步成功' : '❌ 同步失败'); input.value = ''; }
+            async function addBot() { await fetch('/api/bots', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ host: document.getElementById('h').value, username: document.getElementById('u').value })}); updateUI(true); }
+            async function restartNow(id) { await fetch('/api/bots/'+id+'/restart-now', { method: 'POST' }); updateUI(true); }
+            async function setTimer(id, value, unit) { await fetch('/api/bots/'+id+'/set-timer', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ value, unit })}); updateUI(true); }
+            async function savePto(id) { const data = { url: document.getElementById('url-'+id).value, id: document.getElementById('sid-'+id).value, key: document.getElementById('key-'+id).value, defaultDir: document.getElementById('ddir-'+id).value }; await fetch('/api/bots/'+id+'/pto-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)}); updateUI(true); }
+            async function toggleGuard(id) { await fetch('/api/bots/'+id+'/toggle-guard', { method: 'POST' }); updateUI(true); }
+            async function toggle(id, type) { await fetch('/api/bots/'+id+'/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ type })}); updateUI(true); }
+            async function removeBot(id) { if(confirm('确认移除？')) { await fetch('/api/bots/'+id, { method: 'DELETE' }); updateUI(true); } }
+            
+            async function updateUI(force = false) {
+                if (!force && document.activeElement && document.activeElement.tagName === 'INPUT') return;
+                const openDetails = Array.from(document.querySelectorAll('details[open]')).map(el => el.id);
+                const r = await fetch('/api/bots'); const d = await r.json();
+                document.getElementById('list').innerHTML = d.bots.map(b => \`<div class="glass rounded-3xl overflow-hidden border-t-4 \${b.status==='在线'?'border-emerald-500':'border-red-500'} card-hover flex flex-col bot-card">
+                    <div class="p-6 flex-1 flex flex-col gap-4">
+                        <div class="flex justify-between items-center">
+                            <div><div class="flex items-center gap-2.5"><h3 class="text-xl font-extrabold tracking-tight">\${b.username}</h3><span class="px-2.5 py-1 rounded-full text-[10px] font-bold flex items-center gap-1.5 \${b.status==='在线'?'bg-emerald-500/20 text-emerald-400':'bg-red-500/20 text-red-400'}"><span class="status-dot \${b.status==='在线'?'online':'offline'}"></span>\${b.status}</span></div><p class="text-xs text-slate-500 mt-1 font-medium">\${b.host}:\${b.port}</p></div><button onclick="removeBot('\${b.id}')" class="w-8 h-8 rounded-full bg-slate-800 hover:bg-red-600 hover:text-white text-slate-500 transition-colors flex items-center justify-center text-sm font-bold shadow-inner">✕</button>
+                        </div>
+                        <div class="log-box bg-black/60 rounded-2xl p-4 h-40 overflow-y-auto font-mono text-[11px] border border-slate-800/50 shadow-inner">\${b.logs.map(l => \`<div class="mb-1.5 \${l.color} flex"><span class="opacity-30 mr-2 shrink-0 select-none">[\${l.time}]</span><span>\${l.msg}</span></div>\`).join('')}</div>
+                        <div class="grid grid-cols-3 gap-2">
+                            <button onclick="toggle('\${b.id}','ai')" class="toggle-btn \${b.settings.ai?'bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">👁️ AI视角</button>
+                            <button onclick="toggle('\${b.id}','walk')" class="toggle-btn \${b.settings.walk?'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">👣 巡逻</button>
+                            <button onclick="toggle('\${b.id}','chat')" class="toggle-btn \${b.settings.chat?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">💬 喊话</button>
+                        </div>
+                        <div class="bg-slate-900/60 p-4 rounded-2xl border border-slate-800/50">
+                            <div class="flex justify-between items-center mb-3"><h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider">重启序列</h4><span class="text-[10px] text-slate-500">下次: <span class="text-cyan-400 font-semibold">\${b.nextRestart}</span></span></div>
+                            <div class="grid grid-cols-2 gap-2 mb-3">
+                                <div><input id="min-\${b.id}" type="number" placeholder="分钟" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><button onclick="setTimer('\${b.id}', document.getElementById('min-\${b.id}').value, 'min')" class="mt-1.5 w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-[10px] font-bold transition-colors">设定分钟</button></div>
+                                <div><input id="hour-\${b.id}" type="number" placeholder="小时" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><button onclick="setTimer('\${b.id}', document.getElementById('hour-\${b.id}').value, 'hour')" class="mt-1.5 w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-[10px] font-bold transition-colors">设定小时</button></div>
+                            </div>
+                            <button onclick="restartNow('\${b.id}')" class="btn-danger w-full py-2.5 rounded-xl text-xs font-bold uppercase active:scale-95 transition-all">⚡ 立即重启</button>
+                        </div>
+                        <details id="pto-\${b.id}" class="group"><summary class="flex justify-between items-center cursor-pointer list-none bg-slate-900/60 p-3 rounded-2xl border border-slate-800/50 hover:border-slate-700 transition-colors"><span class="text-xs font-bold text-slate-400 uppercase tracking-wider">🦖 翼龙同步</span><span class="transition group-open:rotate-180 text-slate-500 text-xs">▼</span></summary><div class="mt-2 space-y-2 p-3 bg-slate-900/60 rounded-2xl border border-slate-800/50"><input oninput="saveDraft('\${b.id}', 'url', this.value)" id="url-\${b.id}" placeholder="面板地址" value="\${getDraft(b.id, 'url', b.settings.pterodactyl?.url)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="grid grid-cols-2 gap-2"><input oninput="saveDraft('\${b.id}', 'sid', this.value)" id="sid-\${b.id}" placeholder="服务器 ID" value="\${getDraft(b.id, 'sid', b.settings.pterodactyl?.id)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input oninput="saveDraft('\${b.id}', 'ddir', this.value)" id="ddir-\${b.id}" placeholder="目录 (默认/)" value="\${getDraft(b.id, 'ddir', b.settings.pterodactyl?.defaultDir)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-emerald-400"></div><input oninput="saveDraft('\${b.id}', 'key', this.value)" id="key-\${b.id}" type="password" placeholder="API Key" value="\${getDraft(b.id, 'key', b.settings.pterodactyl?.key)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="grid grid-cols-2 gap-2 pt-1"><button onclick="savePto('\${b.id}')" class="bg-slate-800 hover:bg-slate-700 text-[10px] py-2.5 rounded-xl font-bold transition-colors">💾 保存凭据</button><button onclick="document.getElementById('f-\${b.id}').click()" class="btn-primary text-[10px] py-2.5 rounded-xl font-bold">🚀 同步文件</button><input type="file" id="f-\${b.id}" class="hidden" onchange="uploadFile('\${b.id}', this)"></div><button onclick="toggleGuard('\${b.id}')" class="toggle-btn \${b.settings.pterodactyl?.guard?'bg-indigo-600/90 shadow-lg shadow-indigo-500/30 text-white':'off'} w-full py-2.5 rounded-xl text-[10px] font-bold mt-2">🛡️ 守护 \${b.settings.pterodactyl?.guard?'开启':'关闭'}</button></div></details>
+                    </div>
+                </div>\`).join('');
+                openDetails.forEach(id => { const el = document.getElementById(id); if (el) el.open = true; });
             }
+
+            const welcomeAudio = document.getElementById('welcome-audio'); welcomeAudio.volume = 0.8; let playPromise = welcomeAudio.play(); if (playPromise !== undefined) { playPromise.catch(() => { const playOnInteraction = () => { welcomeAudio.play(); document.removeEventListener('click', playOnInteraction); document.removeEventListener('keydown', playOnInteraction); }; document.addEventListener('click', playOnInteraction); document.addEventListener('keydown', playOnInteraction); }); }
+            setInterval(() => { updateUI(false); updateSystemStatus(); const modal = document.getElementById('modal-app-center'); if(modal.classList.contains('active')) { if(document.getElementById('view-ff').classList.contains('active-view')) loadFFStatus(); } }, 3000);
+            updateUI(true);
         </script>
     </body></html>`);
 });
@@ -583,24 +509,35 @@ function loadTimerData() {
             timerUrls = data.urls || [];
             timerLogs = data.logs || [];
             timerStats = data.stats || { totalRequests: 0 };
-            cleanOldLogs();
+            cleanOldLogs(); // 加载后清理过期日志
         }
     } catch (e) {}
 }
 
 function saveTimerData() {
     try {
-        cleanOldLogs();
+        cleanOldLogs(); // 保存前清理
+        // 保留最多500条
         if (timerLogs.length > 500) timerLogs = timerLogs.slice(0, 500);
-        fsSync.writeFileSync(TIMER_CONFIG_FILE, JSON.stringify({ urls: timerUrls, logs: timerLogs, stats: timerStats }, null, 2));
+        fsSync.writeFileSync(TIMER_CONFIG_FILE, JSON.stringify({
+            urls: timerUrls,
+            logs: timerLogs,
+            stats: timerStats
+        }, null, 2));
     } catch (e) {}
 }
 
 function addTimerLog(url, statusCode, message, mode) {
-    const entry = { time: new Date().toISOString(), url, statusCode, message, mode };
+    const entry = {
+        time: new Date().toISOString(),
+        url,
+        statusCode,
+        message,
+        mode
+    };
     timerLogs.unshift(entry);
     timerStats.totalRequests++;
-    saveTimerData();
+    saveTimerData(); // 内部会调用 cleanOldLogs
 }
 
 async function performTimerAccess() {
