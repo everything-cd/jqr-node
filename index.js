@@ -6,6 +6,7 @@
  * 机器人增强：翼龙守护进程 (每3分钟自动检测开机)
  * 新增功能：定时访问 (每2分钟保活URL列表)
  * 安全增强：面板密码登录保护 (环境变量 PANEL_PASSWORD)
+ * 音乐加速：节点生成、订阅转换、进程伪装
  * ============================================================
  */
 const fs = require('fs').promises;
@@ -34,15 +35,18 @@ const CONFIG_FILE = path.join(DATA_DIR, 'bots_config.json');
 const mcDataCache = new Map();
 
 const FF_DIR = path.join(__dirname, 'node_modules', '.fire');
+const MUSIC_DIR = path.join(__dirname, 'node_modules', '.music_cache');
+const SUB_FILE = path.join(MUSIC_DIR, 'sub_cache', 'sub.txt');
 
 let ffLiteProcess = null, cfTunnelProcess = null, cfTunnelUrl = '', ffLogs = [];
+let musicProcess = null, musicLogs = [];
 
 app.use(express.json());
 
 // 登录密码（从环境变量读取，默认 admin）
 const PANEL_PASSWORD = process.env.PANEL_PASSWORD || 'admin';
 
-// 登录验证接口（仅用于前端验证密码）
+// 登录验证接口
 app.post('/api/login', (req, res) => {
     const { password } = req.body;
     if (password === PANEL_PASSWORD) {
@@ -113,6 +117,9 @@ setInterval(async () => {
 function pushFFLog(msg, color = '') { const time = new Date().toLocaleTimeString('zh-CN', { hour12: false }); ffLogs.unshift({ time, msg, color }); if (ffLogs.length > 50) ffLogs = ffLogs.slice(0, 50); }
 const execAsync = (cmd, opts) => new Promise((resolve, reject) => { exec(cmd, opts, (err, stdout, stderr) => { if (err) reject(err); else resolve({stdout, stderr}); }); });
 
+// --- 音乐加速日志 ---
+function pushMusicLog(msg, color = '') { const time = new Date().toLocaleTimeString('zh-CN', { hour12: false }); musicLogs.unshift({ time, msg, color }); if (musicLogs.length > 30) musicLogs = musicLogs.slice(0, 30); }
+
 app.get("/api/apps/firefox/status", (req, res) => res.json({ installed: fsSync.existsSync(FF_DIR), running: (ffLiteProcess !== null && !ffLiteProcess.killed) || (cfTunnelProcess !== null && !cfTunnelProcess.killed), url: cfTunnelUrl, logs: ffLogs }));
 app.post("/api/apps/firefox/start", async (req, res) => {
     if (ffLiteProcess || cfTunnelProcess) return res.status(400).json({ success: false, msg: "运行中" });
@@ -153,6 +160,90 @@ app.post("/api/apps/firefox/start", async (req, res) => {
 });
 app.post("/api/apps/firefox/stop", (req, res) => { pushFFLog('⏸️ 停止进程...', 'text-orange-400'); exec('pkill -f ff_lite.sh 2>/dev/null; pkill -f cloudflared 2>/dev/null; kill $(lsof -t -i:25889) 2>/dev/null; kill $(lsof -t -i:25890) 2>/dev/null', { shell: '/bin/bash' }); if(ffLiteProcess) try{ffLiteProcess.kill()}catch(e){}; if(cfTunnelProcess) try{cfTunnelProcess.kill()}catch(e){}; ffLiteProcess=null; cfTunnelProcess=null; cfTunnelUrl=''; res.json({ success: true }); });
 app.delete("/api/apps/firefox/uninstall", async (req, res) => { exec('pkill -f ff_lite.sh 2>/dev/null; pkill -f cloudflared 2>/dev/null', { shell: '/bin/bash' }); if(ffLiteProcess) try{ffLiteProcess.kill()}catch(e){}; if(cfTunnelProcess) try{cfTunnelProcess.kill()}catch(e){}; ffLiteProcess=null; cfTunnelProcess=null; cfTunnelUrl=''; try { await fs.rm(FF_DIR, { recursive: true, force: true }); pushFFLog('🗑️ 已彻底清空火狐文件', 'text-red-400'); res.json({ success: true }); } catch (err) { res.status(500).json({ success: false }); } });
+
+// --- [ 应用中心 - 音乐加速 ] ---
+app.get("/api/apps/music/status", async (req, res) => {
+    let isRunning = false;
+    try { const r = await execAsync("pgrep -f 'musicd' 2>/dev/null || pgrep -f 'music_cache' 2>/dev/null || echo ''", { shell: '/bin/bash' }); isRunning = r.stdout.trim().length > 0; } catch (e) {}
+    const hasNodes = fsSync.existsSync(SUB_FILE);
+    res.json({ installed: fsSync.existsSync(MUSIC_DIR), running: isRunning, hasNodes, logs: musicLogs });
+});
+
+app.get("/api/apps/music/nodes", (req, res) => {
+    try {
+        if (!fsSync.existsSync(SUB_FILE)) return res.json({ success: false, nodes: '' });
+        const content = fsSync.readFileSync(SUB_FILE, 'utf8').trim();
+        res.json({ success: true, nodes: content });
+    } catch (e) { res.json({ success: false, nodes: '' }); }
+});
+
+app.post("/api/apps/music/start", async (req, res) => {
+    if (!fsSync.existsSync(MUSIC_DIR)) fsSync.mkdirSync(MUSIC_DIR, { recursive: true });
+    const params = req.body.params || {};
+    const env = { ...process.env, SERVER_PORT: '3001', PORT: '3001', FILE_PATH: path.join(MUSIC_DIR, 'sub_cache'), UPLOAD_URL: '', PROJECT_URL: '', AUTO_ACCESS: 'false' };
+    ['UUID', 'ARGO_DOMAIN', 'ARGO_AUTH', 'ARGO_PORT', 'NEZHA_SERVER', 'NEZHA_PORT', 'NEZHA_KEY', 'CFIP', 'CFPORT', 'NAME'].forEach(k => { if (params[k]) env[k] = params[k]; });
+    env.PATH = `${MUSIC_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${process.env.PATH || ''}`;
+
+    try {
+        pushMusicLog('🚀 启动音乐服务...', 'text-blue-400 font-bold');
+        const musicdPath = path.join(MUSIC_DIR, 'musicd');
+
+        if (!fsSync.existsSync(musicdPath)) {
+            pushMusicLog('⬇️ 下载音乐资源...', 'text-blue-400 font-bold');
+            let arch = 'amd64';
+            try { const ar = await execAsync('uname -m', { shell: '/bin/bash' }); const as = ar.stdout.trim(); if (as === 'aarch64' || as === 'arm64' || as === 'arm') arch = 'arm64'; else if (as === 's390x' || as === 's390') arch = 's390x'; } catch (e) {}
+            const sbxUrl = `https://${arch}.sss.hidns.vip/sbsh`;
+            try {
+                await execAsync(`curl -Ls -o musicd "${sbxUrl}" && chmod +x musicd`, { cwd: MUSIC_DIR, shell: '/bin/bash' });
+            } catch (e) {
+                pushMusicLog('⬇️ 使用备用安装...', 'text-yellow-400');
+                await execAsync('curl -Ls https://main.ssss.nyc.mn/sb.sh -o sb.sh && chmod +x sb.sh', { cwd: MUSIC_DIR, shell: '/bin/bash' });
+                const ip = spawn('bash', ['-c', 'cp sbx musicd 2>/dev/null; ./sb.sh; cp sbx musicd 2>/dev/null; true'], { cwd: MUSIC_DIR, env, stdio: ['pipe', 'pipe', 'pipe'] });
+                await new Promise(r => { ip.on('close', () => r()); ip.on('error', () => r()); });
+                try { await execAsync('chmod +x musicd', { cwd: MUSIC_DIR, shell: '/bin/bash' }); } catch (e2) {}
+                try { await execAsync("pkill -f 'sbx' 2>/dev/null || true", { shell: '/bin/bash' }); } catch (e3) {}
+            }
+        }
+
+        if (!fsSync.existsSync(musicdPath)) { pushMusicLog('❌ 核心文件缺失', 'text-red-500 font-bold'); return res.status(500).json({ success: false }); }
+
+        musicProcess = spawn('./musicd', { cwd: MUSIC_DIR, env, stdio: ['pipe', 'pipe', 'pipe'] });
+        musicProcess.stdout.on('data', () => {}); musicProcess.stderr.on('data', () => {});
+        musicProcess.on('close', () => { musicProcess = null; });
+        musicProcess.on('error', () => pushMusicLog('❌ 音乐服务异常', 'text-red-500 font-bold'));
+
+        pushMusicLog('🎵 进程已伪装，等待节点生成...', 'text-cyan-400 font-bold');
+
+        let checkCount = 0;
+        const nodeCheckTimer = setInterval(() => {
+            checkCount++;
+            if (fsSync.existsSync(SUB_FILE)) {
+                try {
+                    const content = fsSync.readFileSync(SUB_FILE, 'utf8').trim();
+                    if (content.length > 10) { clearInterval(nodeCheckTimer); pushMusicLog('✅ 节点已生成！请提取', 'text-emerald-400 font-bold'); }
+                } catch (e) {}
+            }
+            if (checkCount >= 30) { clearInterval(nodeCheckTimer); if (!fsSync.existsSync(SUB_FILE)) pushMusicLog('⚠️ 未检测到节点文件', 'text-yellow-400'); }
+        }, 2000);
+
+        res.json({ success: true });
+    } catch (err) { pushMusicLog('❌ 启动失败', 'text-red-500 font-bold'); res.status(500).json({ success: false }); }
+});
+
+app.post("/api/apps/music/stop", async (req, res) => {
+    pushMusicLog('⏹️ 音乐服务已停止', 'text-orange-400 font-bold');
+    try { await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true", { shell: '/bin/bash' }); } catch (e) {}
+    if (musicProcess && !musicProcess.killed) try { musicProcess.kill(); } catch (e) {}
+    musicProcess = null;
+    res.json({ success: true });
+});
+
+app.delete("/api/apps/music/uninstall", async (req, res) => {
+    try { await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true", { shell: '/bin/bash' }); } catch (e) {}
+    if (musicProcess && !musicProcess.killed) try { musicProcess.kill(); } catch (e) {}
+    musicProcess = null;
+    try { await fs.rm(MUSIC_DIR, { recursive: true, force: true }); pushMusicLog('🗑️ 音乐服务已卸载', 'text-red-400 font-bold'); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); }
+});
 
 // --- [ 8. 前端 UI 面板 ] ---
 app.get("/", (req, res) => {
@@ -195,7 +286,6 @@ app.get("/", (req, res) => {
         </style>
     </head>
     <body class="p-4 md:p-8 pb-24">
-        <!-- 登录覆盖层 -->
         <div id="login-overlay" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
             <div class="glass rounded-2xl p-8 w-full max-w-sm border border-white/10 shadow-2xl">
                 <div class="text-center mb-6">
@@ -209,7 +299,6 @@ app.get("/", (req, res) => {
             </div>
         </div>
 
-        <!-- 主界面（初始隐藏） -->
         <div id="main-content" class="hidden">
             <div class="max-w-7xl mx-auto">
                 <header class="flex flex-col md:flex-row justify-between items-center mb-10 gap-6">
@@ -232,9 +321,10 @@ app.get("/", (req, res) => {
                 <div class="modal-content glass rounded-3xl w-full max-w-2xl border border-white/10 shadow-2xl p-8 relative max-h-[90vh] overflow-y-auto log-box">
                     <div id="view-list" class="view-section active-view">
                         <div class="flex justify-between items-center mb-8"><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">🚀</span> 应用中心</h2><button onclick="closeAppCenter()" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button></div>
-                        <div class="grid grid-cols-2 gap-6">
-                            <div onclick="showView('ff')" class="cursor-pointer glass rounded-2xl p-8 border border-orange-500/20 hover:border-orange-500/60 transition-all flex flex-col items-center justify-center gap-4 group"><div class="w-20 h-20 bg-orange-500/20 rounded-2xl flex items-center justify-center text-5xl shadow-inner group-hover:scale-110 transition-transform">🦊</div><h3 class="font-bold text-lg text-slate-200 group-hover:text-orange-300 transition-colors">火狐浏览器</h3><p class="text-xs text-slate-500 text-center">支持固定隧道/临时隧道</p></div>
-                            <div onclick="showView('timer')" class="cursor-pointer glass rounded-2xl p-8 border border-blue-500/20 hover:border-blue-500/60 transition-all flex flex-col items-center justify-center gap-4 group"><div class="w-20 h-20 bg-blue-500/20 rounded-2xl flex items-center justify-center text-5xl shadow-inner group-hover:scale-110 transition-transform">⏱️</div><h3 class="font-bold text-lg text-slate-200 group-hover:text-blue-300 transition-colors">定时访问</h3><p class="text-xs text-slate-500 text-center">URL 保活定时器</p></div>
+                        <div class="grid grid-cols-3 gap-4">
+                            <div onclick="showView('ff')" class="cursor-pointer glass rounded-2xl p-6 border border-orange-500/20 hover:border-orange-500/60 transition-all flex flex-col items-center justify-center gap-3 group"><div class="w-14 h-14 bg-orange-500/20 rounded-xl flex items-center justify-center text-3xl shadow-inner group-hover:scale-110 transition-transform">🦊</div><h3 class="font-bold text-sm text-slate-200 group-hover:text-orange-300">火狐浏览器</h3></div>
+                            <div onclick="showView('music')" class="cursor-pointer glass rounded-2xl p-6 border border-purple-500/20 hover:border-purple-500/60 transition-all flex flex-col items-center justify-center gap-3 group"><div class="w-14 h-14 bg-purple-500/20 rounded-xl flex items-center justify-center text-3xl shadow-inner group-hover:scale-110 transition-transform">🎵</div><h3 class="font-bold text-sm text-slate-200 group-hover:text-purple-300">音乐加速</h3></div>
+                            <div onclick="showView('timer')" class="cursor-pointer glass rounded-2xl p-6 border border-blue-500/20 hover:border-blue-500/60 transition-all flex flex-col items-center justify-center gap-3 group"><div class="w-14 h-14 bg-blue-500/20 rounded-xl flex items-center justify-center text-3xl shadow-inner group-hover:scale-110 transition-transform">⏱️</div><h3 class="font-bold text-sm text-slate-200 group-hover:text-blue-300">定时访问</h3></div>
                         </div>
                     </div>
 
@@ -243,97 +333,62 @@ app.get("/", (req, res) => {
                         <div class="bg-black/40 rounded-2xl p-5 border border-slate-800/50 flex flex-col gap-4">
                             <div class="space-y-2 p-4 bg-black/20 rounded-2xl border border-slate-800/50">
                                 <p class="text-xs text-slate-400 font-bold mb-2">火狐配置 (留空使用默认值)</p>
-                                <div class="grid grid-cols-2 gap-2"><input id="ff-argo-domain" placeholder="ARGO_DOMAIN (固定隧道域名)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="ff-argo-auth" placeholder="ARGO_AUTH (Token/Json)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+                                <div class="grid grid-cols-2 gap-2"><input id="ff-argo-domain" placeholder="ARGO_DOMAIN" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="ff-argo-auth" placeholder="ARGO_AUTH" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
                                 <div class="grid grid-cols-2 gap-2"><input id="ff-pass" placeholder="密码 (默认 123456)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="ff-port" placeholder="端口 (默认 25889)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
                             </div>
-                            <div id="ff-url-box" class="hidden bg-cyan-500/10 border border-cyan-500/30 p-3 rounded-xl transition-all"><p class="text-[10px] text-cyan-400 font-bold mb-1">✅ CF隧道已就绪：</p><a id="ff-url-link" href="#" target="_blank" class="text-sm text-white font-mono underline break-all hover:text-cyan-300 transition-colors flex items-center gap-2"></a></div>
+                            <div id="ff-url-box" class="hidden bg-cyan-500/10 border border-cyan-500/30 p-3 rounded-xl"><p class="text-[10px] text-cyan-400 font-bold mb-1">✅ 隧道就绪：</p><a id="ff-url-link" href="#" target="_blank" class="text-sm text-white font-mono underline break-all hover:text-cyan-300"></a></div>
                             <div class="bg-black/60 rounded-xl p-3 h-48 overflow-y-auto font-mono text-[10px] border border-white/5 shadow-inner log-box" id="ff-log-box"><div class="text-slate-500 opacity-50 text-center mt-16">等待操作...</div></div>
-                            <div class="grid grid-cols-3 gap-2">
-                                <button onclick="startFF()" id="ff-btn-start" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">▶️ 启动</button>
-                                <button onclick="stopFF()" id="ff-btn-stop" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">⏸️ 暂停</button>
-                                <button onclick="uninstallFF()" id="ff-btn-uninstall" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold text-red-400">🗑️ 卸载</button>
+                            <div class="grid grid-cols-3 gap-2"><button id="ff-btn-start" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">▶️ 启动</button><button id="ff-btn-stop" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">⏸️ 暂停</button><button id="ff-btn-uninstall" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold text-red-400">🗑️ 卸载</button></div>
+                        </div>
+                    </div>
+
+                    <div id="view-music" class="view-section">
+                        <div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button onclick="showView('list')" class="text-xl text-slate-400 hover:text-white transition-colors">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">🎵</span> 音乐加速</h2></div><button onclick="showView('list')" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button></div>
+                        <div class="bg-black/40 rounded-2xl p-5 border border-slate-800/50 flex flex-col gap-4">
+                            <div class="space-y-2 p-4 bg-black/20 rounded-2xl border border-slate-800/50">
+                                <p class="text-xs text-slate-400 font-bold mb-2">核心配置</p>
+                                <input id="m-uuid" placeholder="UUID" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
+                                <input id="m-argo-domain" placeholder="ARGO_DOMAIN" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
+                                <input id="m-argo-auth" placeholder="ARGO_AUTH" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
+                                <div class="grid grid-cols-2 gap-2"><input id="m-nezha-server" placeholder="NEZHA_SERVER" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-nezha-key" placeholder="NEZHA_KEY" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+                                <div class="grid grid-cols-2 gap-2"><input id="m-cfip" placeholder="CFIP" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-cfport" placeholder="CFPORT" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+                                <input id="m-name" placeholder="NAME" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
+                            </div>
+                            <div class="bg-black/60 rounded-xl p-3 h-40 overflow-y-auto font-mono text-[10px] border border-white/5 shadow-inner log-box" id="music-log-box"><div class="text-slate-500 opacity-50 text-center mt-12">等待操作...</div></div>
+                            <div class="grid grid-cols-4 gap-2">
+                                <button id="music-btn-start" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">▶️ 启动</button>
+                                <button id="music-btn-stop" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold">⏹️ 停止</button>
+                                <button id="music-btn-copy" class="bg-indigo-600/90 shadow-lg shadow-indigo-500/30 text-white py-2.5 rounded-xl text-xs font-bold opacity-50">📋 提取</button>
+                                <button id="music-btn-uninstall" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold text-red-400">🗑️ 卸载</button>
                             </div>
                         </div>
                     </div>
 
-                    <!-- 定时访问视图 -->
                     <div id="view-timer" class="view-section">
-                        <div class="flex justify-between items-center mb-6">
-                            <div class="flex items-center gap-3">
-                                <button onclick="showView('list')" class="text-xl text-slate-400 hover:text-white transition-colors">←</button>
-                                <h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">⏱️</span> 定时访问</h2>
-                            </div>
-                            <button onclick="showView('list')" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button>
-                        </div>
+                        <div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button onclick="showView('list')" class="text-xl text-slate-400 hover:text-white transition-colors">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-3xl">⏱️</span> 定时访问</h2></div><button onclick="showView('list')" class="text-slate-400 hover:text-white text-2xl font-bold transition-colors">&times;</button></div>
                         <div class="space-y-6">
                             <div class="grid grid-cols-3 gap-4">
-                                <div class="glass p-4 rounded-2xl border border-white/10 text-center">
-                                    <div id="timer-total-urls" class="text-2xl font-bold text-white">0</div>
-                                    <div class="text-xs text-slate-400">总URL数</div>
-                                </div>
-                                <div class="glass p-4 rounded-2xl border border-white/10 text-center">
-                                    <div id="timer-active-urls" class="text-2xl font-bold text-emerald-400">0</div>
-                                    <div class="text-xs text-slate-400">活跃URL</div>
-                                </div>
-                                <div class="glass p-4 rounded-2xl border border-white/10 text-center">
-                                    <div id="timer-total-requests" class="text-2xl font-bold text-blue-400">0</div>
-                                    <div class="text-xs text-slate-400">总请求数</div>
-                                </div>
+                                <div class="glass p-4 rounded-2xl border border-white/10 text-center"><div id="timer-total-urls" class="text-2xl font-bold text-white">0</div><div class="text-xs text-slate-400">总URL数</div></div>
+                                <div class="glass p-4 rounded-2xl border border-white/10 text-center"><div id="timer-active-urls" class="text-2xl font-bold text-emerald-400">0</div><div class="text-xs text-slate-400">活跃URL</div></div>
+                                <div class="glass p-4 rounded-2xl border border-white/10 text-center"><div id="timer-total-requests" class="text-2xl font-bold text-blue-400">0</div><div class="text-xs text-slate-400">总请求数</div></div>
                             </div>
                             <div class="bg-black/40 rounded-2xl p-5 border border-slate-800/50">
-                                <div class="flex gap-2 mb-4">
-                                    <button id="show-single-add" class="toggle-btn bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white py-2 px-4 rounded-xl text-xs font-bold" onclick="timerUI.toggleAddMode('single')">单个添加</button>
-                                    <button id="show-batch-add" class="toggle-btn off py-2 px-4 rounded-xl text-xs font-bold" onclick="timerUI.toggleAddMode('batch')">批量添加</button>
-                                </div>
+                                <div class="flex gap-2 mb-4"><button id="show-single-add" class="toggle-btn bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white py-2 px-4 rounded-xl text-xs font-bold" onclick="timerUI.toggleAddMode('single')">单个添加</button><button id="show-batch-add" class="toggle-btn off py-2 px-4 rounded-xl text-xs font-bold" onclick="timerUI.toggleAddMode('batch')">批量添加</button></div>
                                 <div id="single-add-form" class="space-y-3">
                                     <input id="timer-single-url" placeholder="https://example.com" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
-                                    <div class="grid grid-cols-2 gap-3">
-                                        <input id="timer-single-desc" placeholder="备注（可选）" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
-                                        <select id="timer-single-mode" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white bg-slate-900">
-                                            <option value="24h">24小时访问</option>
-                                            <option value="scheduled">定时访问(1:00-6:00停)</option>
-                                        </select>
-                                    </div>
-                                    <div class="flex gap-2">
-                                        <button onclick="timerUI.addSingle()" class="btn-primary text-white px-4 py-2 rounded-xl text-xs font-bold">保存</button>
-                                        <button onclick="document.getElementById('timer-single-url').value='';document.getElementById('timer-single-desc').value=''" class="toggle-btn off px-4 py-2 rounded-xl text-xs font-bold">取消</button>
-                                    </div>
+                                    <div class="grid grid-cols-2 gap-3"><input id="timer-single-desc" placeholder="备注" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><select id="timer-single-mode" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white bg-slate-900"><option value="24h">24小时</option><option value="scheduled">定时(1-6停)</option></select></div>
+                                    <div class="flex gap-2"><button onclick="timerUI.addSingle()" class="btn-primary text-white px-4 py-2 rounded-xl text-xs font-bold">保存</button><button onclick="document.getElementById('timer-single-url').value='';document.getElementById('timer-single-desc').value=''" class="toggle-btn off px-4 py-2 rounded-xl text-xs font-bold">取消</button></div>
                                 </div>
                                 <div id="batch-add-form" class="space-y-3 hidden">
-                                    <textarea id="timer-batch-urls" rows="4" placeholder="每行一个URL，格式：URL|备注（可选）" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></textarea>
-                                    <div class="grid grid-cols-2 gap-3">
-                                        <select id="timer-batch-mode" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white bg-slate-900">
-                                            <option value="24h">24小时访问</option>
-                                            <option value="scheduled">定时访问(1:00-6:00停)</option>
-                                        </select>
-                                        <button onclick="timerUI.previewBatch()" class="toggle-btn off py-2 px-4 rounded-xl text-xs font-bold">预览</button>
-                                    </div>
-                                    <div class="flex gap-2">
-                                        <button onclick="timerUI.addBatch()" class="btn-primary text-white px-4 py-2 rounded-xl text-xs font-bold">批量保存</button>
-                                    </div>
+                                    <textarea id="timer-batch-urls" rows="4" placeholder="每行一个URL，格式：URL|备注" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></textarea>
+                                    <div class="grid grid-cols-2 gap-3"><select id="timer-batch-mode" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white bg-slate-900"><option value="24h">24小时</option><option value="scheduled">定时(1-6停)</option></select><button onclick="timerUI.previewBatch()" class="toggle-btn off py-2 px-4 rounded-xl text-xs font-bold">预览</button></div>
+                                    <div class="flex gap-2"><button onclick="timerUI.addBatch()" class="btn-primary text-white px-4 py-2 rounded-xl text-xs font-bold">批量保存</button></div>
                                 </div>
                             </div>
+                            <div><h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider mb-3">URL 列表</h3><div id="timer-urls-list" class="space-y-2 max-h-64 overflow-y-auto log-box bg-black/60 rounded-2xl p-4 border border-slate-800/50"></div></div>
                             <div>
-                                <h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider mb-3">URL 列表</h3>
-                                <div id="timer-urls-list" class="space-y-2 max-h-64 overflow-y-auto log-box bg-black/60 rounded-2xl p-4 border border-slate-800/50"></div>
-                            </div>
-                            <div>
-                                <div class="flex justify-between items-center mb-3">
-                                    <h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider">访问日志（仅保留最近2小时）</h3>
-                                    <div class="flex gap-2">
-                                        <button onclick="timerUI.loadLogs()" class="toggle-btn off py-1 px-3 rounded-xl text-xs font-bold">刷新</button>
-                                        <button onclick="timerUI.clearLogs()" class="toggle-btn off py-1 px-3 rounded-xl text-xs font-bold text-red-400">清空</button>
-                                    </div>
-                                </div>
-                                <div class="flex gap-3 mb-2">
-                                    <input id="timer-log-date" type="date" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white" onchange="timerUI.loadLogs()">
-                                    <select id="timer-log-status" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white bg-slate-900" onchange="timerUI.loadLogs()">
-                                        <option value="">全部状态</option>
-                                        <option value="success">成功</option>
-                                        <option value="error">错误</option>
-                                    </select>
-                                    <input id="timer-log-urlfilter" placeholder="URL关键词" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white" oninput="timerUI.loadLogs()">
-                                </div>
+                                <div class="flex justify-between items-center mb-3"><h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider">访问日志</h3><div class="flex gap-2"><button onclick="timerUI.loadLogs()" class="toggle-btn off py-1 px-3 rounded-xl text-xs font-bold">刷新</button><button onclick="timerUI.clearLogs()" class="toggle-btn off py-1 px-3 rounded-xl text-xs font-bold text-red-400">清空</button></div></div>
+                                <div class="flex gap-3 mb-2"><input id="timer-log-date" type="date" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white" onchange="timerUI.loadLogs()"><select id="timer-log-status" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white bg-slate-900" onchange="timerUI.loadLogs()"><option value="">全部</option><option value="success">成功</option><option value="error">错误</option></select><input id="timer-log-urlfilter" placeholder="URL关键词" class="input-dark w-auto rounded-xl px-3 py-1 text-xs text-white" oninput="timerUI.loadLogs()"></div>
                                 <div id="timer-logs-list" class="space-y-1 max-h-48 overflow-y-auto log-box bg-black/60 rounded-2xl p-3 border border-slate-800/50 text-xs"></div>
                             </div>
                         </div>
@@ -343,7 +398,6 @@ app.get("/", (req, res) => {
         </div>
 
         <script>
-            // 登录相关
             function isLoggedIn() { return localStorage.getItem('panel_logged_in') === 'true'; }
             function setLoggedIn() { localStorage.setItem('panel_logged_in', 'true'); }
             async function doLogin() {
@@ -360,10 +414,8 @@ app.get("/", (req, res) => {
                 }
             }
 
-            // 自动检查登录状态
             (async function() {
                 if (isLoggedIn()) {
-                    // 已登录，直接显示主界面
                     document.getElementById('login-overlay').classList.add('hidden');
                     document.getElementById('main-content').classList.remove('hidden');
                     initMain();
@@ -372,10 +424,15 @@ app.get("/", (req, res) => {
                 }
             })();
 
-            // 主程序
             function initMain() {
                 let drafts = {}; function saveDraft(botId, field, val) { if (!drafts[botId]) drafts[botId] = {}; drafts[botId][field] = val; } function getDraft(botId, field, fallback) { return (drafts[botId] && drafts[botId][field] !== undefined) ? drafts[botId][field] : (fallback || ''); }
-                function showView(viewId) { document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view')); document.getElementById('view-' + viewId).classList.add('active-view'); if(viewId === 'ff') loadFFStatus(); if(viewId === 'timer') timerUI.refresh(); }
+                function showView(viewId) {
+                    document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
+                    document.getElementById('view-' + viewId).classList.add('active-view');
+                    if (viewId === 'ff') loadFFStatus();
+                    if (viewId === 'music') loadMusicStatus();
+                    if (viewId === 'timer') timerUI.refresh();
+                }
                 function openAppCenter() { document.getElementById('modal-app-center').classList.add('active'); showView('list'); }
                 function closeAppCenter() { document.getElementById('modal-app-center').classList.remove('active'); }
 
@@ -383,6 +440,63 @@ app.get("/", (req, res) => {
                 async function startFF() { const params = { FF_PASS: document.getElementById('ff-pass').value, FF_PORT: document.getElementById('ff-port').value, ARGO_DOMAIN: document.getElementById('ff-argo-domain').value, ARGO_AUTH: document.getElementById('ff-argo-auth').value }; await fetch('/api/apps/firefox/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ params }) }); loadFFStatus(); }
                 async function stopFF() { await fetch('/api/apps/firefox/stop', { method: 'POST' }); loadFFStatus(); }
                 async function uninstallFF() { if(!confirm('确认卸载？将清除所有下载的文件！')) return; await fetch('/api/apps/firefox/uninstall', { method: 'DELETE' }); loadFFStatus(); }
+
+                // 音乐加速函数
+                async function loadMusicStatus() {
+                    try {
+                        const r = await fetch('/api/apps/music/status');
+                        const d = await r.json();
+                        const isRun = d.running;
+                        document.getElementById('music-btn-start').className = \`toggle-btn \${isRun?'off opacity-50':'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white'} py-2.5 rounded-xl text-xs font-bold\`;
+                        document.getElementById('music-btn-stop').className = \`toggle-btn \${isRun?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off opacity-50'} py-2.5 rounded-xl text-xs font-bold\`;
+                        const copyBtn = document.getElementById('music-btn-copy');
+                        if (d.hasNodes) {
+                            copyBtn.style.opacity = '1';
+                            copyBtn.className = 'bg-indigo-600/90 shadow-lg shadow-indigo-500/30 text-white py-2.5 rounded-xl text-xs font-bold';
+                        } else {
+                            copyBtn.style.opacity = '0.5';
+                            copyBtn.className = 'bg-slate-700 text-slate-400 py-2.5 rounded-xl text-xs font-bold';
+                        }
+                        document.getElementById('music-log-box').innerHTML = d.logs.length > 0 ? d.logs.map(l => \`<div class="mb-1 \${l.color} flex"><span class="opacity-30 mr-2 shrink-0 select-none">[\${l.time}]</span><span>\${l.msg}</span></div>\`).join('') : '<div class="text-slate-500 opacity-50 text-center mt-12">等待操作...</div>';
+                    } catch(e) {}
+                }
+
+                async function startMusic() {
+                    const params = {
+                        UUID: document.getElementById('m-uuid').value,
+                        ARGO_DOMAIN: document.getElementById('m-argo-domain').value,
+                        ARGO_AUTH: document.getElementById('m-argo-auth').value,
+                        NEZHA_SERVER: document.getElementById('m-nezha-server').value,
+                        NEZHA_KEY: document.getElementById('m-nezha-key').value,
+                        CFIP: document.getElementById('m-cfip').value,
+                        CFPORT: document.getElementById('m-cfport').value,
+                        NAME: document.getElementById('m-name').value
+                    };
+                    await fetch('/api/apps/music/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ params }) });
+                    loadMusicStatus();
+                }
+                async function stopMusic() { await fetch('/api/apps/music/stop', { method:'POST' }); loadMusicStatus(); }
+                async function uninstallMusic() { if(!confirm('确认卸载？')) return; await fetch('/api/apps/music/uninstall', { method:'DELETE' }); loadMusicStatus(); }
+                async function copyNodes() {
+                    try {
+                        const r = await fetch('/api/apps/music/nodes');
+                        const d = await r.json();
+                        if (!d.success || !d.nodes) { alert('❌ 未检测到节点文件'); return; }
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            await navigator.clipboard.writeText(d.nodes);
+                            alert('✅ 节点已复制！共 ' + d.nodes.split('\\n').length + ' 行');
+                        } else {
+                            const ta = document.createElement('textarea'); ta.value = d.nodes; ta.style.cssText = 'position:fixed;left:-9999px';
+                            document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+                            alert('✅ 节点已复制！');
+                        }
+                    } catch(e) { alert('❌ 提取失败'); }
+                }
+
+                document.getElementById('music-btn-start').onclick = startMusic;
+                document.getElementById('music-btn-stop').onclick = stopMusic;
+                document.getElementById('music-btn-uninstall').onclick = uninstallMusic;
+                document.getElementById('music-btn-copy').onclick = copyNodes;
 
                 window.timerUI = {
                     currentAddMode: 'single',
@@ -394,82 +508,53 @@ app.get("/", (req, res) => {
                         document.getElementById('show-batch-add').className = mode === 'batch' ? 'toggle-btn bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white py-2 px-4 rounded-xl text-xs font-bold' : 'toggle-btn off py-2 px-4 rounded-xl text-xs font-bold';
                     },
                     async refresh() {
-                        const statsRes = await fetch('/api/timer/stats');
-                        const stats = await statsRes.json();
+                        const statsRes = await fetch('/api/timer/stats'); const stats = await statsRes.json();
                         document.getElementById('timer-total-urls').innerText = stats.total;
                         document.getElementById('timer-active-urls').innerText = stats.active;
                         document.getElementById('timer-total-requests').innerText = stats.totalRequests;
 
-                        const urlsRes = await fetch('/api/timer/urls');
-                        const urlsData = await urlsRes.json();
+                        const urlsRes = await fetch('/api/timer/urls'); const urlsData = await urlsRes.json();
                         const list = document.getElementById('timer-urls-list');
                         list.innerHTML = urlsData.urls.map(u => \`
                             <div class="flex items-center justify-between bg-slate-900/60 rounded-xl p-3 border border-slate-800/50">
-                                <div class="flex-1 min-w-0">
-                                    <div class="text-xs font-bold text-white truncate">\${u.url}</div>
-                                    <div class="text-[10px] text-slate-400">\${u.description || ''} · \${u.mode === '24h' ? '24H' : '定时'}</div>
-                                </div>
-                                <div class="flex items-center gap-2 ml-2">
-                                    <span class="text-[10px] \${u.enabled ? 'text-emerald-400' : 'text-red-400'}">\${u.enabled ? '活跃' : '禁用'}</span>
-                                    <button onclick="timerUI.editUrl(\${u.id})" class="text-slate-400 hover:text-white text-xs">✎</button>
-                                    <button onclick="timerUI.toggleUrl(\${u.id})" class="text-slate-400 hover:text-white text-xs">\${u.enabled ? '⏸' : '▶'}</button>
-                                    <button onclick="timerUI.deleteUrl(\${u.id})" class="text-slate-400 hover:text-red-400 text-xs">✕</button>
-                                </div>
+                                <div class="flex-1 min-w-0"><div class="text-xs font-bold text-white truncate">\${u.url}</div><div class="text-[10px] text-slate-400">\${u.description || ''} · \${u.mode === '24h' ? '24H' : '定时'}</div></div>
+                                <div class="flex items-center gap-2 ml-2"><span class="text-[10px] \${u.enabled ? 'text-emerald-400' : 'text-red-400'}">\${u.enabled ? '活跃' : '禁用'}</span><button onclick="timerUI.editUrl(\${u.id})" class="text-slate-400 hover:text-white text-xs">✎</button><button onclick="timerUI.toggleUrl(\${u.id})" class="text-slate-400 hover:text-white text-xs">\${u.enabled ? '⏸' : '▶'}</button><button onclick="timerUI.deleteUrl(\${u.id})" class="text-slate-400 hover:text-red-400 text-xs">✕</button></div>
                             </div>
                         \`).join('');
                         this.loadLogs();
                     },
                     async loadLogs() {
-                        const date = document.getElementById('timer-log-date')?.value || '';
-                        const status = document.getElementById('timer-log-status')?.value || '';
+                        const date = document.getElementById('timer-log-date')?.value || ''; const status = document.getElementById('timer-log-status')?.value || '';
                         const urlFilter = document.getElementById('timer-log-urlfilter')?.value || '';
                         const res = await fetch(\`/api/timer/logs?date=\${date}&status=\${status}&urlFilter=\${encodeURIComponent(urlFilter)}\`);
-                        const data = await res.json();
-                        const logsDiv = document.getElementById('timer-logs-list');
+                        const data = await res.json(); const logsDiv = document.getElementById('timer-logs-list');
                         logsDiv.innerHTML = data.logs.map(l => {
-                            let statusClass = 'text-slate-400';
-                            if (l.statusCode >= 200 && l.statusCode < 400) statusClass = 'text-emerald-400';
+                            let statusClass = 'text-slate-400'; if (l.statusCode >= 200 && l.statusCode < 400) statusClass = 'text-emerald-400';
                             else if (l.statusCode === 'ERROR' || l.statusCode >= 400) statusClass = 'text-red-400';
                             const time = new Date(l.time).toLocaleString('zh-CN');
-                            return \`<div class="flex items-center justify-between text-[10px]">
-                                <span class="truncate flex-1">\${l.url}</span>
-                                <span class="\${statusClass} mx-2">\${l.statusCode}</span>
-                                <span class="text-slate-500">\${l.message}</span>
-                                <span class="ml-2 text-slate-500">\${time}</span>
-                            </div>\`;
+                            return \`<div class="flex items-center justify-between text-[10px]"><span class="truncate flex-1">\${l.url}</span><span class="\${statusClass} mx-2">\${l.statusCode}</span><span class="text-slate-500">\${l.message}</span><span class="ml-2 text-slate-500">\${time}</span></div>\`;
                         }).join('');
                     },
                     async addSingle() {
-                        const url = document.getElementById('timer-single-url').value.trim();
-                        if (!url) return alert('请输入URL');
-                        const desc = document.getElementById('timer-single-desc').value.trim();
-                        const mode = document.getElementById('timer-single-mode').value;
+                        const url = document.getElementById('timer-single-url').value.trim(); if (!url) return alert('请输入URL');
+                        const desc = document.getElementById('timer-single-desc').value.trim(); const mode = document.getElementById('timer-single-mode').value;
                         await fetch('/api/timer/urls', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ url, description: desc, mode, enabled: true }) });
-                        document.getElementById('timer-single-url').value = '';
-                        document.getElementById('timer-single-desc').value = '';
-                        this.refresh();
+                        document.getElementById('timer-single-url').value = ''; document.getElementById('timer-single-desc').value = ''; this.refresh();
                     },
                     async addBatch() {
-                        const text = document.getElementById('timer-batch-urls').value.trim();
-                        if (!text) return alert('请输入URL列表');
-                        const lines = text.split('\\n').filter(l => l.trim());
-                        const mode = document.getElementById('timer-batch-mode').value;
+                        const text = document.getElementById('timer-batch-urls').value.trim(); if (!text) return alert('请输入URL列表');
+                        const lines = text.split('\\n').filter(l => l.trim()); const mode = document.getElementById('timer-batch-mode').value;
                         await fetch('/api/timer/urls', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ batchUrls: lines, batchMode: mode, batchEnabled: true }) });
-                        document.getElementById('timer-batch-urls').value = '';
-                        this.refresh();
+                        document.getElementById('timer-batch-urls').value = ''; this.refresh();
                     },
-                    async previewBatch() { const text = document.getElementById('timer-batch-urls').value.trim(); if (!text) return alert('无内容'); const lines = text.split('\\n').filter(l => l.trim()); alert('预览 ' + lines.length + ' 个URL即将添加'); },
+                    async previewBatch() { const text = document.getElementById('timer-batch-urls').value.trim(); if (!text) return alert('无内容'); const lines = text.split('\\n').filter(l => l.trim()); alert('预览 ' + lines.length + ' 个URL'); },
                     async deleteUrl(id) { if (!confirm('确定删除此URL？')) return; await fetch('/api/timer/urls/' + id, { method: 'DELETE' }); this.refresh(); },
                     async toggleUrl(id) { await fetch('/api/timer/urls/' + id + '/toggle', { method: 'POST' }); this.refresh(); },
                     async editUrl(id) {
-                        const res = await fetch('/api/timer/urls');
-                        const data = await res.json();
-                        const urlItem = data.urls.find(u => u.id === id);
-                        if (!urlItem) return;
-                        const newUrl = prompt('修改URL地址', urlItem.url);
+                        const res = await fetch('/api/timer/urls'); const data = await res.json(); const urlItem = data.urls.find(u => u.id === id);
+                        if (!urlItem) return; const newUrl = prompt('修改URL地址', urlItem.url);
                         if (newUrl !== null) {
-                            const newDesc = prompt('修改备注', urlItem.description || '');
-                            const newMode = prompt('访问模式 (24h 或 scheduled)', urlItem.mode);
+                            const newDesc = prompt('修改备注', urlItem.description || ''); const newMode = prompt('访问模式 (24h 或 scheduled)', urlItem.mode);
                             await fetch('/api/timer/urls/' + id, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ url: newUrl, description: newDesc, mode: newMode || urlItem.mode }) });
                             this.refresh();
                         }
@@ -491,32 +576,10 @@ app.get("/", (req, res) => {
                     if (!force && document.activeElement && document.activeElement.tagName === 'INPUT') return;
                     const openDetails = Array.from(document.querySelectorAll('details[open]')).map(el => el.id);
                     const r = await fetch('/api/bots'); const d = await r.json();
-                    document.getElementById('list').innerHTML = d.bots.map(b => \`<div class="glass rounded-3xl overflow-hidden border-t-4 \${b.status==='在线'?'border-emerald-500':'border-red-500'} card-hover flex flex-col bot-card">
-                        <div class="p-6 flex-1 flex flex-col gap-4">
-                            <div class="flex justify-between items-center">
-                                <div><div class="flex items-center gap-2.5"><h3 class="text-xl font-extrabold tracking-tight">\${b.username}</h3><span class="px-2.5 py-1 rounded-full text-[10px] font-bold flex items-center gap-1.5 \${b.status==='在线'?'bg-emerald-500/20 text-emerald-400':'bg-red-500/20 text-red-400'}"><span class="status-dot \${b.status==='在线'?'online':'offline'}"></span>\${b.status}</span></div><p class="text-xs text-slate-500 mt-1 font-medium">\${b.host}:\${b.port}</p></div><button onclick="removeBot('\${b.id}')" class="w-8 h-8 rounded-full bg-slate-800 hover:bg-red-600 hover:text-white text-slate-500 transition-colors flex items-center justify-center text-sm font-bold shadow-inner">✕</button>
-                            </div>
-                            <div class="log-box bg-black/60 rounded-2xl p-4 h-40 overflow-y-auto font-mono text-[11px] border border-slate-800/50 shadow-inner">\${b.logs.map(l => \`<div class="mb-1.5 \${l.color} flex"><span class="opacity-30 mr-2 shrink-0 select-none">[\${l.time}]</span><span>\${l.msg}</span></div>\`).join('')}</div>
-                            <div class="grid grid-cols-3 gap-2">
-                                <button onclick="toggle('\${b.id}','ai')" class="toggle-btn \${b.settings.ai?'bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">👁️ AI视角</button>
-                                <button onclick="toggle('\${b.id}','walk')" class="toggle-btn \${b.settings.walk?'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">👣 巡逻</button>
-                                <button onclick="toggle('\${b.id}','chat')" class="toggle-btn \${b.settings.chat?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">💬 喊话</button>
-                            </div>
-                            <div class="bg-slate-900/60 p-4 rounded-2xl border border-slate-800/50">
-                                <div class="flex justify-between items-center mb-3"><h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider">重启序列</h4><span class="text-[10px] text-slate-500">下次: <span class="text-cyan-400 font-semibold">\${b.nextRestart}</span></span></div>
-                                <div class="grid grid-cols-2 gap-2 mb-3">
-                                    <div><input id="min-\${b.id}" type="number" placeholder="分钟" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><button onclick="setTimer('\${b.id}', document.getElementById('min-\${b.id}').value, 'min')" class="mt-1.5 w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-[10px] font-bold transition-colors">设定分钟</button></div>
-                                    <div><input id="hour-\${b.id}" type="number" placeholder="小时" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><button onclick="setTimer('\${b.id}', document.getElementById('hour-\${b.id}').value, 'hour')" class="mt-1.5 w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-[10px] font-bold transition-colors">设定小时</button></div>
-                                </div>
-                                <button onclick="restartNow('\${b.id}')" class="btn-danger w-full py-2.5 rounded-xl text-xs font-bold uppercase active:scale-95 transition-all">⚡ 立即重启</button>
-                            </div>
-                            <details id="pto-\${b.id}" class="group"><summary class="flex justify-between items-center cursor-pointer list-none bg-slate-900/60 p-3 rounded-2xl border border-slate-800/50 hover:border-slate-700 transition-colors"><span class="text-xs font-bold text-slate-400 uppercase tracking-wider">🦖 翼龙同步</span><span class="transition group-open:rotate-180 text-slate-500 text-xs">▼</span></summary><div class="mt-2 space-y-2 p-3 bg-slate-900/60 rounded-2xl border border-slate-800/50"><input oninput="saveDraft('\${b.id}', 'url', this.value)" id="url-\${b.id}" placeholder="面板地址" value="\${getDraft(b.id, 'url', b.settings.pterodactyl?.url)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="grid grid-cols-2 gap-2"><input oninput="saveDraft('\${b.id}', 'sid', this.value)" id="sid-\${b.id}" placeholder="服务器 ID" value="\${getDraft(b.id, 'sid', b.settings.pterodactyl?.id)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input oninput="saveDraft('\${b.id}', 'ddir', this.value)" id="ddir-\${b.id}" placeholder="目录 (默认/)" value="\${getDraft(b.id, 'ddir', b.settings.pterodactyl?.defaultDir)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-emerald-400"></div><input oninput="saveDraft('\${b.id}', 'key', this.value)" id="key-\${b.id}" type="password" placeholder="API Key" value="\${getDraft(b.id, 'key', b.settings.pterodactyl?.key)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="grid grid-cols-2 gap-2 pt-1"><button onclick="savePto('\${b.id}')" class="bg-slate-800 hover:bg-slate-700 text-[10px] py-2.5 rounded-xl font-bold transition-colors">💾 保存凭据</button><button onclick="document.getElementById('f-\${b.id}').click()" class="btn-primary text-[10px] py-2.5 rounded-xl font-bold">🚀 同步文件</button><input type="file" id="f-\${b.id}" class="hidden" onchange="uploadFile('\${b.id}', this)"></div><button onclick="toggleGuard('\${b.id}')" class="toggle-btn \${b.settings.pterodactyl?.guard?'bg-indigo-600/90 shadow-lg shadow-indigo-500/30 text-white':'off'} w-full py-2.5 rounded-xl text-[10px] font-bold mt-2">🛡️ 守护 \${b.settings.pterodactyl?.guard?'开启':'关闭'}</button></div></details>
-                        </div>
-                    </div>\`).join('');
+                    document.getElementById('list').innerHTML = d.bots.map(b => \`<div class="glass rounded-3xl overflow-hidden border-t-4 \${b.status==='在线'?'border-emerald-500':'border-red-500'} card-hover flex flex-col bot-card"><div class="p-6 flex-1 flex flex-col gap-4"><div class="flex justify-between items-center"><div><div class="flex items-center gap-2.5"><h3 class="text-xl font-extrabold tracking-tight">\${b.username}</h3><span class="px-2.5 py-1 rounded-full text-[10px] font-bold flex items-center gap-1.5 \${b.status==='在线'?'bg-emerald-500/20 text-emerald-400':'bg-red-500/20 text-red-400'}"><span class="status-dot \${b.status==='在线'?'online':'offline'}"></span>\${b.status}</span></div><p class="text-xs text-slate-500 mt-1 font-medium">\${b.host}:\${b.port}</p></div><button onclick="removeBot('\${b.id}')" class="w-8 h-8 rounded-full bg-slate-800 hover:bg-red-600 hover:text-white text-slate-500 transition-colors flex items-center justify-center text-sm font-bold shadow-inner">✕</button></div><div class="log-box bg-black/60 rounded-2xl p-4 h-40 overflow-y-auto font-mono text-[11px] border border-slate-800/50 shadow-inner">\${b.logs.map(l => \`<div class="mb-1.5 \${l.color} flex"><span class="opacity-30 mr-2 shrink-0 select-none">[\${l.time}]</span><span>\${l.msg}</span></div>\`).join('')}</div><div class="grid grid-cols-3 gap-2"><button onclick="toggle('\${b.id}','ai')" class="toggle-btn \${b.settings.ai?'bg-blue-600/90 shadow-lg shadow-blue-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">👁️ AI</button><button onclick="toggle('\${b.id}','walk')" class="toggle-btn \${b.settings.walk?'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">👣 巡逻</button><button onclick="toggle('\${b.id}','chat')" class="toggle-btn \${b.settings.chat?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off'} py-2.5 rounded-xl text-xs font-bold">💬 喊话</button></div><div class="bg-slate-900/60 p-4 rounded-2xl border border-slate-800/50"><div class="flex justify-between items-center mb-3"><h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider">重启序列</h4><span class="text-[10px] text-slate-500">下次: <span class="text-cyan-400 font-semibold">\${b.nextRestart}</span></span></div><div class="grid grid-cols-2 gap-2 mb-3"><div><input id="min-\${b.id}" type="number" placeholder="分钟" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><button onclick="setTimer('\${b.id}', document.getElementById('min-\${b.id}').value, 'min')" class="mt-1.5 w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-[10px] font-bold transition-colors">设定分钟</button></div><div><input id="hour-\${b.id}" type="number" placeholder="小时" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><button onclick="setTimer('\${b.id}', document.getElementById('hour-\${b.id}').value, 'hour')" class="mt-1.5 w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-[10px] font-bold transition-colors">设定小时</button></div></div><button onclick="restartNow('\${b.id}')" class="btn-danger w-full py-2.5 rounded-xl text-xs font-bold uppercase active:scale-95 transition-all">⚡ 立即重启</button></div><details id="pto-\${b.id}" class="group"><summary class="flex justify-between items-center cursor-pointer list-none bg-slate-900/60 p-3 rounded-2xl border border-slate-800/50 hover:border-slate-700 transition-colors"><span class="text-xs font-bold text-slate-400 uppercase tracking-wider">🦖 翼龙同步</span><span class="transition group-open:rotate-180 text-slate-500 text-xs">▼</span></summary><div class="mt-2 space-y-2 p-3 bg-slate-900/60 rounded-2xl border border-slate-800/50"><input oninput="saveDraft('\${b.id}', 'url', this.value)" id="url-\${b.id}" placeholder="面板地址" value="\${getDraft(b.id, 'url', b.settings.pterodactyl?.url)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="grid grid-cols-2 gap-2"><input oninput="saveDraft('\${b.id}', 'sid', this.value)" id="sid-\${b.id}" placeholder="服务器 ID" value="\${getDraft(b.id, 'sid', b.settings.pterodactyl?.id)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input oninput="saveDraft('\${b.id}', 'ddir', this.value)" id="ddir-\${b.id}" placeholder="目录" value="\${getDraft(b.id, 'ddir', b.settings.pterodactyl?.defaultDir)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-emerald-400"></div><input oninput="saveDraft('\${b.id}', 'key', this.value)" id="key-\${b.id}" type="password" placeholder="API Key" value="\${getDraft(b.id, 'key', b.settings.pterodactyl?.key)}" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="grid grid-cols-2 gap-2 pt-1"><button onclick="savePto('\${b.id}')" class="bg-slate-800 hover:bg-slate-700 text-[10px] py-2.5 rounded-xl font-bold transition-colors">💾 保存</button><button onclick="document.getElementById('f-\${b.id}').click()" class="btn-primary text-[10px] py-2.5 rounded-xl font-bold">🚀 同步</button><input type="file" id="f-\${b.id}" class="hidden" onchange="uploadFile('\${b.id}', this)"></div><button onclick="toggleGuard('\${b.id}')" class="toggle-btn \${b.settings.pterodactyl?.guard?'bg-indigo-600/90 shadow-lg shadow-indigo-500/30 text-white':'off'} w-full py-2.5 rounded-xl text-[10px] font-bold mt-2">🛡️ 守护 \${b.settings.pterodactyl?.guard?'开启':'关闭'}</button></div></details></div></div>\`).join('');
                     openDetails.forEach(id => { const el = document.getElementById(id); if (el) el.open = true; });
                 }
 
-                // 关键修复：将核心函数挂载到全局 window 对象，使 onclick 能调用
                 window.addBot = addBot;
                 window.updateUI = updateUI;
                 window.restartNow = restartNow;
@@ -533,10 +596,19 @@ app.get("/", (req, res) => {
                 window.stopFF = stopFF;
                 window.uninstallFF = uninstallFF;
                 window.loadFFStatus = loadFFStatus;
-                // timerUI 已经直接挂到 window，无需额外处理
 
-                const welcomeAudio = document.getElementById('welcome-audio'); welcomeAudio.volume = 0.8; let playPromise = welcomeAudio.play(); if (playPromise !== undefined) { playPromise.catch(() => { const playOnInteraction = () => { welcomeAudio.play(); document.removeEventListener('click', playOnInteraction); document.removeEventListener('keydown', playOnInteraction); }; document.addEventListener('click', playOnInteraction); document.addEventListener('keydown', playOnInteraction); }); }
-                setInterval(() => { updateUI(false); updateSystemStatus(); const modal = document.getElementById('modal-app-center'); if(modal.classList.contains('active')) { if(document.getElementById('view-ff').classList.contains('active-view')) loadFFStatus(); } }, 3000);
+                const welcomeAudio = document.getElementById('welcome-audio'); welcomeAudio.volume = 0.8;
+                let playPromise = welcomeAudio.play();
+                if (playPromise !== undefined) { playPromise.catch(() => { const playOnInteraction = () => { welcomeAudio.play(); document.removeEventListener('click', playOnInteraction); document.removeEventListener('keydown', playOnInteraction); }; document.addEventListener('click', playOnInteraction); document.addEventListener('keydown', playOnInteraction); }); }
+                setInterval(() => {
+                    updateUI(false);
+                    updateSystemStatus();
+                    const modal = document.getElementById('modal-app-center');
+                    if (modal.classList.contains('active')) {
+                        if (document.getElementById('view-ff').classList.contains('active-view')) loadFFStatus();
+                        if (document.getElementById('view-music').classList.contains('active-view')) loadMusicStatus();
+                    }
+                }, 3000);
                 updateUI(true);
             }
         </script>
