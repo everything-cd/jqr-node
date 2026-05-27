@@ -161,7 +161,7 @@ app.get("/", (req, res) => {
     <html lang="zh-CN">
     <head>
         <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>🤗 机器人面板</title>
+        <title>🤗 AI面板</title>
         <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤗</text></svg>">
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
@@ -200,7 +200,7 @@ app.get("/", (req, res) => {
             <div class="glass rounded-2xl p-8 w-full max-w-sm border border-white/10 shadow-2xl">
                 <div class="text-center mb-6">
                     <div class="text-5xl mb-3">🤗</div>
-                    <h2 class="text-xl font-bold text-white">机器人面板</h2>
+                    <h2 class="text-xl font-bold text-white">AI面板</h2>
                     <p class="text-slate-400 text-sm mt-1">请输入访问密码</p>
                 </div>
                 <input id="login-password" type="password" placeholder="密码" class="input-dark w-full rounded-xl px-4 py-3 text-sm text-white mb-4" onkeydown="if(event.key==='Enter')doLogin()">
